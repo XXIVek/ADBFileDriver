@@ -23,6 +23,7 @@ public:
         epEnableLog,
         epLogPath,
         epStatus,
+        epDeviceCount,
         epLast      
     };
 
@@ -30,6 +31,8 @@ public:
     {
         emConnect,
         emDisconnect,
+        emEnumerateDevices,
+        emGetDeviceInfo,
         emLast      
     };
 
@@ -89,6 +92,20 @@ private:
     // Состояние подключения
     bool                m_bConnected;
     wchar_t             m_Status[512];
+
+    // Устройства ADB
+    wchar_t             m_DeviceList[8192];  // JSON строка с устройствами
+    uint32_t            m_DeviceCount;
+};
+
+// Структура для хранения информации об устройстве
+struct ADBDeviceInfo {
+    wchar_t serial[64];
+    wchar_t model[128];
+    wchar_t device[64];
+    wchar_t type[32];
+    unsigned short vendorId;
+    unsigned short productId;
 };
 
 class WcharWrapper
