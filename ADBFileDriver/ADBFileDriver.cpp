@@ -35,6 +35,7 @@ bool ADBFileDriver::Init(void* Interface)
     if (Interface == nullptr) return false;
     m_iConnect = static_cast<IAddInDefBase*>(Interface);
     m_bInitialized = true;
+    LogWrite(L"Компонента инициализирована");
     return true;
 }
 
@@ -57,6 +58,7 @@ void ADBFileDriver::Done()
     {
         std::lock_guard<std::mutex> lock(m_LogMutex);
         if (m_LogFile.is_open()) {
+            m_LogFile << "Компонента деинициализирована" << std::endl;
             m_LogFile.close();
         }
     }
@@ -110,16 +112,26 @@ bool ADBFileDriver::GetPropVal(const long lPropNum, tVariant* pvarPropVal)
     try {
         switch (lPropNum) {
             case 0: // Version
+            {
                 TV_VT(pvarPropVal) = VTYPE_PWSTR;
-                // Выделить память через менеджер памяти 1С
-                if (m_iMemory) {
-                    size_t len = wcslen(L"1.0.0.1") + 1;
-                    m_iMemory->AllocMemory((void**)&pvarPropVal->pwstrVal, (unsigned long)(len * sizeof(WCHAR_T)));
-                    convToShortWchar(&pvarPropVal->pwstrVal, L"1.0.0.1", (uint32_t)len);
-                } else {
-                    pvarPropVal->pwstrVal = reinterpret_cast<WCHAR_T*>(SysAllocString(L"1.0.0.1"));
-                }
+                const wchar_t* versionStr = L"1.0.0.1";
+                size_t len = wcslen(versionStr) + 1;
+                // Выделяем память через SysAllocString для BSTR
+                pvarPropVal->pwstrVal = SysAllocString(versionStr);
                 return pvarPropVal->pwstrVal != nullptr;
+            }
+            case 1: // EnableLog
+            {
+                TV_VT(pvarPropVal) = VTYPE_BOOL;
+                TV_BOOL(pvarPropVal) = m_EnableLog ? VARIANT_TRUE : VARIANT_FALSE;
+                return true;
+            }
+            case 2: // LogPath
+            {
+                TV_VT(pvarPropVal) = VTYPE_PWSTR;
+                pvarPropVal->pwstrVal = SysAllocString(m_LogPath);
+                return pvarPropVal->pwstrVal != nullptr;
+            }
             default:
                 TV_VT(pvarPropVal) = VTYPE_EMPTY;
                 return false;
@@ -143,10 +155,56 @@ bool ADBFileDriver::GetPropVal(const long lPropNum, tVariant* pvarPropVal)
 
 bool ADBFileDriver::SetPropVal(const long lPropNum, tVariant* varPropVal)
 {
-    // Свойства только для чтения
-    (void)lPropNum;
-    (void)varPropVal;
-    return false;
+    try {
+        switch (lPropNum) {
+            case 1: // EnableLog
+            {
+                if (TV_VT(varPropVal) == VTYPE_BOOL) {
+                    m_EnableLog = TV_BOOL(varPropVal) == VARIANT_TRUE;
+                    if (m_EnableLog) {
+                        LogWrite(L"Логирование включено");
+                    } else {
+                        LogWrite(L"Логирование выключено");
+                        // Закрываем лог файл
+                        {
+                            std::lock_guard<std::mutex> lock(m_LogMutex);
+                            if (m_LogFile.is_open()) {
+                                m_LogFile.close();
+                            }
+                        }
+                    }
+                }
+                return true;
+            }
+            case 2: // LogPath
+            {
+                if (TV_VT(varPropVal) == VTYPE_PWSTR && varPropVal->pwstrVal != nullptr) {
+                    size_t len = wcslen(varPropVal->pwstrVal);
+                    if (len > 0 && len < 511) {
+                        wcsncpy_s(m_LogPath, varPropVal->pwstrVal, len);
+                        m_LogPath[len + 1] = L'\0';
+                        LogWrite(L"Путь логирования изменен");
+                    }
+                }
+                return true;
+            }
+            default:
+                return false;
+        }
+    } catch (...) {
+        if (m_iConnect) {
+            EXCEPINFO info;
+            ZeroMemory(&info, sizeof(EXCEPINFO));
+            info.wCode = ADDIN_E_FAIL;
+            info.bstrSource = SysAllocString(L"ADBFileDriver");
+            info.bstrDescription = SysAllocString(L"Error");
+            info.scode = E_FAIL;
+            m_iConnect->AddError(info.wCode, info.bstrSource, info.bstrDescription, info.scode);
+            SysFreeString(info.bstrSource);
+            SysFreeString(info.bstrDescription);
+        }
+        return false;
+    }
 }
 
 bool ADBFileDriver::IsPropReadable(const long lPropNum)
@@ -156,7 +214,8 @@ bool ADBFileDriver::IsPropReadable(const long lPropNum)
 
 bool ADBFileDriver::IsPropWritable(const long lPropNum)
 {
-    return false;
+    // EnableLog и LogPath - записываемые
+    return lPropNum == 1 || lPropNum == 2;
 }
 
 // ===== ILanguageExtenderBase - Методы =====
