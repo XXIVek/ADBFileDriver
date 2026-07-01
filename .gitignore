@@ -1,0 +1,25 @@
+# Build output
+build/
+1C/Release/Win64/Release/
+1C/Release/Win32/
+
+# Visual Studio
+*.sln
+*.vcxproj
+*.vcxproj.filters
+*.VC.db
+*.user
+
+# Compiler output
+*.obj
+*.lib
+*.exp
+*.dll
+*.exe
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+
+# Logs
+*.log

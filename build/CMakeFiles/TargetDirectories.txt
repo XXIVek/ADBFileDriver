@@ -1,3 +1,0 @@
-J:/Visual studio prog/ADBFileDriver/build/CMakeFiles/ADBFileDriver_Win64.dir
-J:/Visual studio prog/ADBFileDriver/build/CMakeFiles/ALL_BUILD.dir
-J:/Visual studio prog/ADBFileDriver/build/CMakeFiles/ZERO_CHECK.dir
