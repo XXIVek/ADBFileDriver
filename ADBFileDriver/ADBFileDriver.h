@@ -83,8 +83,8 @@ private:
     // Параметры логирования
     bool                m_EnableLog;
     wchar_t             m_LogPath[512];
-    std::ofstream       m_LogFile;
-    std::mutex          m_LogMutex;
+    void*               m_LogHandle;  // HANDLE instead of std::ofstream
+    CRITICAL_SECTION    m_LogLock;
 
     // Состояние подключения
     bool                m_bConnected;

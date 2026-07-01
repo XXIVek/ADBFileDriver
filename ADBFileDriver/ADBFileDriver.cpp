@@ -20,24 +20,32 @@ static const wchar_t* g_MethodNamesRU[] = { L"Подключить", L"Откл�
 ADBFileDriver::ADBFileDriver(void)
     : m_iConnect(nullptr), m_iMemory(nullptr), m_bInitialized(false)
     , m_EnableLog(false), m_bConnected(false)
+    , m_LogHandle(INVALID_HANDLE_VALUE)
 {
     // Инициализация пути логирования по умолчанию (временная папка)
     ExpandEnvironmentStringsW(L"%TEMP%\\ADBFileDriver.log", m_LogPath, 512);
     // Инициализация статуса
     wcscpy_s(m_Status, 512, L"Не подключен");
+    // Инициализация критической секции
+    InitializeCriticalSection(&m_LogLock);
 }
 
 ADBFileDriver::~ADBFileDriver()
 {
-    // Безопасное уничтожение - без использования std::lock_guard
-    if (m_LogFile.is_open()) {
-        try {
-            m_LogFile << "Компонента деинициализирована" << std::endl;
-            m_LogFile.close();
-        } catch (...) {
-            // Игнорируем ошибки при уничтожении
-        }
+    // Безопасное уничтожение - используем только Windows API
+    if (m_LogHandle != INVALID_HANDLE_VALUE) {
+        CloseHandle(m_LogHandle);
+        m_LogHandle = INVALID_HANDLE_VALUE;
     }
+    DeleteCriticalSection(&m_LogLock);
+    
+    if (m_iConnect) {
+        m_iConnect = nullptr;
+    }
+    if (m_iMemory) {
+        m_iMemory = nullptr;
+    }
+    m_bInitialized = false;
 }
 
 // ===== IInitDoneBase =====
@@ -60,19 +68,14 @@ bool ADBFileDriver::setMemManager(void* memManager)
 
 long ADBFileDriver::GetInfo()
 {
-    // Версия: 1.0.0.1 = 100001
     return 100001;
 }
 
 void ADBFileDriver::Done()
 {
-    // Закрытие лог файла (без lock_guard для безопасности)
-    if (m_LogFile.is_open()) {
-        try {
-            m_LogFile << "Компонента деинициализирована" << std::endl;
-            m_LogFile.close();
-        } catch (...) {
-        }
+    if (m_LogHandle != INVALID_HANDLE_VALUE) {
+        CloseHandle(m_LogHandle);
+        m_LogHandle = INVALID_HANDLE_VALUE;
     }
     
     if (m_iConnect) {
@@ -121,7 +124,7 @@ const WCHAR_T* ADBFileDriver::GetPropName(long lPropNum, long lPropAlias)
 
 bool ADBFileDriver::GetPropVal(const long lPropNum, tVariant* pvarPropVal)
 {
-    try {
+    __try {
         switch (lPropNum) {
             case 0: // Version
             {
@@ -152,7 +155,7 @@ bool ADBFileDriver::GetPropVal(const long lPropNum, tVariant* pvarPropVal)
                 TV_VT(pvarPropVal) = VTYPE_EMPTY;
                 return false;
         }
-    } catch (...) {
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
         if (m_iConnect) {
             EXCEPINFO info;
             ZeroMemory(&info, sizeof(EXCEPINFO));
@@ -171,7 +174,7 @@ bool ADBFileDriver::GetPropVal(const long lPropNum, tVariant* pvarPropVal)
 
 bool ADBFileDriver::SetPropVal(const long lPropNum, tVariant* varPropVal)
 {
-    try {
+    __try {
         switch (lPropNum) {
             case 1: // EnableLog
             {
@@ -181,8 +184,9 @@ bool ADBFileDriver::SetPropVal(const long lPropNum, tVariant* varPropVal)
                         LogWrite(L"Логирование включено");
                     } else {
                         LogWrite(L"Логирование выключено");
-                        if (m_LogFile.is_open()) {
-                            m_LogFile.close();
+                        if (m_LogHandle != INVALID_HANDLE_VALUE) {
+                            CloseHandle(m_LogHandle);
+                            m_LogHandle = INVALID_HANDLE_VALUE;
                         }
                     }
                 }
@@ -202,7 +206,7 @@ bool ADBFileDriver::SetPropVal(const long lPropNum, tVariant* varPropVal)
             default:
                 return false;
         }
-    } catch (...) {
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
         if (m_iConnect) {
             EXCEPINFO info;
             ZeroMemory(&info, sizeof(EXCEPINFO));
@@ -295,7 +299,7 @@ bool ADBFileDriver::CallAsFunc(const long lMethodNum, tVariant* pvarRetValue, tV
     (void)paParams;
     (void)lSizeArray;
     
-    try {
+    __try {
         TV_VT(pvarRetValue) = VTYPE_BOOL;
         
         switch (lMethodNum) {
@@ -321,7 +325,7 @@ bool ADBFileDriver::CallAsFunc(const long lMethodNum, tVariant* pvarRetValue, tV
                 TV_BOOL(pvarRetValue) = VARIANT_FALSE;
                 return false;
         }
-    } catch (...) {
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
         if (m_iConnect) {
             EXCEPINFO info;
             ZeroMemory(&info, sizeof(EXCEPINFO));
@@ -345,25 +349,32 @@ void ADBFileDriver::LogWrite(const wchar_t* message)
 {
     if (!m_EnableLog) return;
     
-    // Простая блокировка без lock_guard для безопасности
-    try {
-        // Критическая секция
-        if (!m_LogFile.is_open()) {
-            m_LogFile.open(m_LogPath, std::ios::app);
-            if (!m_LogFile.is_open()) return;
+    EnterCriticalSection(&m_LogLock);
+    
+    // Открываем файл если не открыт
+    if (m_LogHandle == INVALID_HANDLE_VALUE) {
+        m_LogHandle = CreateFileW(m_LogPath, GENERIC_WRITE, FILE_SHARE_READ, NULL, 
+                                   OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (m_LogHandle == INVALID_HANDLE_VALUE) {
+            LeaveCriticalSection(&m_LogLock);
+            return;
         }
-        
-        SYSTEMTIME st;
-        GetLocalTime(&st);
-        
-        m_LogFile << "[" 
-                  << st.wHour << ":" << st.wMinute << ":" << st.wSecond << "." 
-                  << st.wMilliseconds << "] " 
-                  << message << std::endl;
-        m_LogFile.flush();
-    } catch (...) {
-        // Игнорируем ошибки логирования
+        // Перемещаем в конец файла
+        SetFilePointer(m_LogHandle, 0, NULL, FILE_END);
     }
+    
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    
+    // Формируем строку лога
+    wchar_t logEntry[256];
+    int len = swprintf_s(logEntry, L"[%d:%02d:%02d.%03d] %s\n",
+                          st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, message);
+    
+    DWORD bytesWritten;
+    WriteFile(m_LogHandle, logEntry, (DWORD)(len * sizeof(wchar_t)), &bytesWritten, NULL);
+    
+    LeaveCriticalSection(&m_LogLock);
 }
 
 // ===== LocaleBase =====
