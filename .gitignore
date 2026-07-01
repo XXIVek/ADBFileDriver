@@ -1,25 +1,80 @@
-# Build output
+# ========== BUILD OUTPUT ==========
 build/
-1C/Release/Win64/Release/
+1C/Release/Win64/
 1C/Release/Win32/
+1C/Release/
 
-# Visual Studio
+# ========== VISUAL STUDIO ==========
 *.sln
+*.suo
+*.user
 *.vcxproj
 *.vcxproj.filters
+*.vcxproj.user
 *.VC.db
-*.user
-
-# Compiler output
+*.opensdf
+*.sdf
+*.ipdb
+*.pdb
+*.tlb
+*.tlh
+*.idb
 *.obj
-*.lib
-*.exp
-*.dll
-*.exe
+*.ilk
+*.res
 
-# CMake
+# ========== CMAKE ==========
 CMakeCache.txt
 CMakeFiles/
-
-# Logs
+cmake_install.cmake
+install_manifest.txt
+Makefile
+*.cache
 *.log
+
+# ========== COMPILER OUTPUT ==========
+*.exp
+*.lib
+*.dll
+*.exe
+*.ilk
+*.obj
+*.pdb
+*.ilk
+
+# ========== WINDOWS ==========
+Thumbs.db
+Thumbs.db?
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# ========== TEMPORARY FILES ==========
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+*.bak
+*.old
+*.orig
+
+# ========== IDE ==========
+.vs/
+.vscode/
+*.code-workspace
+.idea/
+
+# ========== LOGS ==========
+*.log
+
+# ========== NODE / NPM (если понадобятся) ==========
+node_modules/
+npm-debug.log
+yarn.lock
+
+# ========== OTHER ==========
+*.crdownload
+*.part
+*.gid

@@ -10,8 +10,12 @@
 
 ### Версия 1.0.0.1 (01.07.2026)
 - Создана базовая структура проекта
-- Реализована MVP версия компоненты для Win64
+- Реализована MVP версия компоненты для Win64 и Win32
 - Добавлено одно свойство `Версия` для проверки подключения
+- Настроен .gitignore с исключениями для всех build-артефактов
+- Настроен CMakeLists.txt с поддержкой Win64 и Win32 сборок
+- Настроен build.ps1 скрипт для автоматической сборки
+- Настроен Git репозиторий с удалённым origin
 
 ---
 
@@ -24,8 +28,11 @@
 - Создана структура проекта
 - Реализована базовая Native API компонента
 - Добавлено свойство `Версия` со значением "1.0.0.1"
-- Создан CMakeLists.txt для сборки Win64
+- Создан CMakeLists.txt для сборки Win64 и Win32
 - Создан MANIFEST.xml для упаковки в конфигурацию 1С
+- Настроен .gitignore с полными исключениями
+- Настроен build.ps1 скрипт сборки
+- Настроен Git репозиторий
 
 ### Этап 2: USB подключение (Планируется)
 - Автоматическое обнаружение USB Android устройств
@@ -50,7 +57,7 @@
 ## Структура проекта
 
 ```
-J:\Visual studio prog\ADBFileDriver\
+ADBFileDriver/
 ├── ADBFileDriver/                          (исходники C++)
 │   ├── ADBFileDriver.h                     (заголовок класса)
 │   ├── ADBFileDriver.cpp                   (реализация)
@@ -60,18 +67,24 @@ J:\Visual studio prog\ADBFileDriver\
 │   ├── ComponentBase.h
 │   ├── AddInDefBase.h
 │   ├── IMemoryManager.h
+│   ├── IAndroidComponentHelper.h
 │   ├── types.h
 │   ├── com.h
 │   └── ...
-├── CMakeLists.txt                          (сборка проекта)
 ├── bundle/
 │   └── MANIFEST.xml                        (manifest для 1С)
-├── 1C/Release/Win64/                       (выходная папка сборки)
-│   ├── ADBFileDriver_Win64.dll
-│   └── bundle/
-│       └── MANIFEST.xml
-└── Docs/
-    └── Драйвер_ADB_для_1С.md              (эта документация)
+├── Docs/
+│   └── Драйвер_ADB_для_1С.md              (эта документация)
+├── CMakeLists.txt                          (сборка проекта)
+├── build.ps1                               (скрипт сборки PowerShell)
+├── .gitignore                              (исключения Git)
+├── 1C/Release/Win64/                       (выход Win64)
+│   └── ADBFileDriver_Win64.dll
+├── 1C/Release/Win32/                       (выход Win32)
+│   └── ADBFileDriver_Win32.dll
+├── 1C/Release/bundle/                      (bundle для 1С)
+│   └── MANIFEST.xml
+└── build/                                  (временная папка CMake)
 ```
 
 ---
@@ -80,26 +93,48 @@ J:\Visual studio prog\ADBFileDriver\
 
 ### Требования
 - CMake 3.10+
-- MSVC (Visual Studio 2019 или новее)
+- MSVC (Visual Studio 2022 рекомендован)
+- PowerShell 5.1+
 
-### Команда сборки
+### Способ 1: Автоматическая сборка (рекомендуется)
+
 ```powershell
-# Создание директории build
+# Запуск скрипта сборки из корня проекта
+.\build.ps1
+```
+
+Скрипт автоматически:
+1. Проверит наличие CMake и MSBuild
+2. Сгенерирует проект CMake для Win64 и Win32
+2. Соберёт обе архитектуры в Release режиме
+3. Скопирует MANIFEST.xml в папку bundle
+
+### Способ 2: Ручная сборка через CMake
+
+```powershell
+# Win64 сборка
 New-Item -ItemType Directory -Path build -Force
 cd build
-
-# Генерация проекта
 cmake .. -G "Visual Studio 17 2022" -A x64
-
-# Сборка
 cmake --build . --config Release
+cd ..
+
+# Win32 сборка
+Remove-Item build -Recurse -Force
+New-Item -ItemType Directory -Path build -Force
+cd build
+cmake .. -G "Visual Studio 17 2022" -A Win32
+cmake --build . --config Release
+cd ..
 ```
 
-### Результат
-После сборки DLL будет расположена в:
-```
-J:\Visual studio prog\ADBFileDriver\1C\Release\Win64\ADBFileDriver_Win64.dll
-```
+### Результат сборки
+
+| Архитектура | Путь к DLL |
+|-------------|------------|
+| Win64 | `1C/Release/Win64/ADBFileDriver_Win64.dll` |
+| Win32 | `1C/Release/Win32/ADBFileDriver_Win32.dll` |
+| Bundle | `1C/Release/bundle/MANIFEST.xml` |
 
 ---
 
@@ -198,7 +233,7 @@ J:\Visual studio prog\ADBFileDriver\1C\Release\Win64\ADBFileDriver_Win64.dll
 
 ## Дальнейшее развитие
 
-1. **Добавление Win32 сборки** — для поддержки 32-битной 1С
+1. ~~**Добавление Win32 сборки**~~ — ✅ Выполнено в версии 1.0.0.1
 2. **USB подключение** — автоматическое обнаружение и подключение устройств
 3. **ADB протокол** — реализация ADB протокола поверх USB
 4. **Файловые операции** — передача файлов туда-обратно
