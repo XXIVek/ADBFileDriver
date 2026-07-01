@@ -130,8 +130,12 @@ bool ADBFileDriver::GetPropVal(const long lPropNum, tVariant* pvarPropVal)
             {
                 TV_VT(pvarPropVal) = VTYPE_PWSTR;
                 const wchar_t* versionStr = L"1.0.0.1";
-                pvarPropVal->pwstrVal = SysAllocString(versionStr);
-                return pvarPropVal->pwstrVal != nullptr;
+                size_t len = wcslen(versionStr) + 1;
+                if (m_iMemory && m_iMemory->AllocMemory((void**)&pvarPropVal->pwstrVal, (unsigned long)(len * sizeof(WCHAR_T)))) {
+                    convToShortWchar((WCHAR_T**)&pvarPropVal->pwstrVal, versionStr, (uint32_t)len);
+                }
+                pvarPropVal->wstrLen = (uint32_t)wcslen(versionStr);
+                return true;
             }
             case 1: // EnableLog
             {
@@ -142,14 +146,22 @@ bool ADBFileDriver::GetPropVal(const long lPropNum, tVariant* pvarPropVal)
             case 2: // LogPath
             {
                 TV_VT(pvarPropVal) = VTYPE_PWSTR;
-                pvarPropVal->pwstrVal = SysAllocString(m_LogPath);
-                return pvarPropVal->pwstrVal != nullptr;
+                size_t len = wcslen(m_LogPath) + 1;
+                if (m_iMemory && m_iMemory->AllocMemory((void**)&pvarPropVal->pwstrVal, (unsigned long)(len * sizeof(WCHAR_T)))) {
+                    convToShortWchar((WCHAR_T**)&pvarPropVal->pwstrVal, m_LogPath, (uint32_t)len);
+                }
+                pvarPropVal->wstrLen = (uint32_t)wcslen(m_LogPath);
+                return true;
             }
             case 3: // Status
             {
                 TV_VT(pvarPropVal) = VTYPE_PWSTR;
-                pvarPropVal->pwstrVal = SysAllocString(m_Status);
-                return pvarPropVal->pwstrVal != nullptr;
+                size_t len = wcslen(m_Status) + 1;
+                if (m_iMemory && m_iMemory->AllocMemory((void**)&pvarPropVal->pwstrVal, (unsigned long)(len * sizeof(WCHAR_T)))) {
+                    convToShortWchar((WCHAR_T**)&pvarPropVal->pwstrVal, m_Status, (uint32_t)len);
+                }
+                pvarPropVal->wstrLen = (uint32_t)wcslen(m_Status);
+                return true;
             }
             default:
                 TV_VT(pvarPropVal) = VTYPE_EMPTY;
