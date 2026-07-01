@@ -22,11 +22,14 @@ public:
         epVersion,
         epEnableLog,
         epLogPath,
+        epStatus,
         epLast      
     };
 
     enum Methods
     {
+        emConnect,
+        emDisconnect,
         emLast      
     };
 
@@ -82,6 +85,10 @@ private:
     wchar_t             m_LogPath[512];
     std::ofstream       m_LogFile;
     std::mutex          m_LogMutex;
+
+    // Состояние подключения
+    bool                m_bConnected;
+    wchar_t             m_Status[512];
 };
 
 class WcharWrapper

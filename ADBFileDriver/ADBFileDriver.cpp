@@ -5,22 +5,26 @@
 #include "ADBFileDriver.h"
 
 // Глобальные массивы имен свойств
-static const wchar_t* g_PropNamesEN[] = { L"Version", L"EnableLog", L"LogPath" };
-static const wchar_t* g_PropNamesRU[] = { L"Версия", L"ВключитьЛогирование", L"ПутьДляФайлаЛогирования" };
-#define PROPS_COUNT 3
+static const wchar_t* g_PropNamesEN[] = { L"Version", L"EnableLog", L"LogPath", L"Status" };
+static const wchar_t* g_PropNamesRU[] = { L"Версия", L"ВключитьЛогирование", L"ПутьДляФайлаЛогирования", L"Статус" };
+#define PROPS_COUNT 4
 
-// Глобальные массивы имен методов (пусто для MVP)
-#define METHODS_COUNT 0
+// Глобальные массивы имен методов
+static const wchar_t* g_MethodNamesEN[] = { L"Connect", L"Disconnect" };
+static const wchar_t* g_MethodNamesRU[] = { L"Подключить", L"Отключить" };
+#define METHODS_COUNT 2
 
 ///////////////////////////////////////////////////////////////////////////////
 // ADBFileDriver
 
 ADBFileDriver::ADBFileDriver(void)
     : m_iConnect(nullptr), m_iMemory(nullptr), m_bInitialized(false)
-    , m_EnableLog(false)
+    , m_EnableLog(false), m_bConnected(false)
 {
     // Инициализация пути логирования по умолчанию (временная папка)
     ExpandEnvironmentStringsW(L"%TEMP%\\ADBFileDriver.log", m_LogPath, 512);
+    // Инициализация статуса
+    wcscpy_s(m_Status, 512, L"Не подключен");
 }
 
 ADBFileDriver::~ADBFileDriver()
@@ -76,7 +80,7 @@ void ADBFileDriver::Done()
 
 long ADBFileDriver::GetNProps()
 {
-    return PROPS_COUNT; // Версия, ВключитьЛогирование, ПутьДляФайлаЛогирования
+    return PROPS_COUNT;
 }
 
 long ADBFileDriver::FindProp(const WCHAR_T* wsPropName)
@@ -115,8 +119,6 @@ bool ADBFileDriver::GetPropVal(const long lPropNum, tVariant* pvarPropVal)
             {
                 TV_VT(pvarPropVal) = VTYPE_PWSTR;
                 const wchar_t* versionStr = L"1.0.0.1";
-                size_t len = wcslen(versionStr) + 1;
-                // Выделяем память через SysAllocString для BSTR
                 pvarPropVal->pwstrVal = SysAllocString(versionStr);
                 return pvarPropVal->pwstrVal != nullptr;
             }
@@ -130,6 +132,12 @@ bool ADBFileDriver::GetPropVal(const long lPropNum, tVariant* pvarPropVal)
             {
                 TV_VT(pvarPropVal) = VTYPE_PWSTR;
                 pvarPropVal->pwstrVal = SysAllocString(m_LogPath);
+                return pvarPropVal->pwstrVal != nullptr;
+            }
+            case 3: // Status
+            {
+                TV_VT(pvarPropVal) = VTYPE_PWSTR;
+                pvarPropVal->pwstrVal = SysAllocString(m_Status);
                 return pvarPropVal->pwstrVal != nullptr;
             }
             default:
@@ -160,12 +168,11 @@ bool ADBFileDriver::SetPropVal(const long lPropNum, tVariant* varPropVal)
             case 1: // EnableLog
             {
                 if (TV_VT(varPropVal) == VTYPE_BOOL) {
-                    m_EnableLog = TV_BOOL(varPropVal) == VARIANT_TRUE;
+                    m_EnableLog = (TV_BOOL(varPropVal) == VARIANT_TRUE);
                     if (m_EnableLog) {
                         LogWrite(L"Логирование включено");
                     } else {
                         LogWrite(L"Логирование выключено");
-                        // Закрываем лог файл
                         {
                             std::lock_guard<std::mutex> lock(m_LogMutex);
                             if (m_LogFile.is_open()) {
@@ -181,8 +188,7 @@ bool ADBFileDriver::SetPropVal(const long lPropNum, tVariant* varPropVal)
                 if (TV_VT(varPropVal) == VTYPE_PWSTR && varPropVal->pwstrVal != nullptr) {
                     size_t len = wcslen(varPropVal->pwstrVal);
                     if (len > 0 && len < 511) {
-                        wcsncpy_s(m_LogPath, varPropVal->pwstrVal, len);
-                        m_LogPath[len + 1] = L'\0';
+                        wcscpy_s(m_LogPath, 512, varPropVal->pwstrVal);
                         LogWrite(L"Путь логирования изменен");
                     }
                 }
@@ -214,7 +220,6 @@ bool ADBFileDriver::IsPropReadable(const long lPropNum)
 
 bool ADBFileDriver::IsPropWritable(const long lPropNum)
 {
-    // EnableLog и LogPath - записываемые
     return lPropNum == 1 || lPropNum == 2;
 }
 
@@ -222,45 +227,35 @@ bool ADBFileDriver::IsPropWritable(const long lPropNum)
 
 long ADBFileDriver::GetNMethods()
 {
-    return METHODS_COUNT; // Нет методов в MVP
-}
-
-// ===== Логирование =====
-
-void ADBFileDriver::LogWrite(const wchar_t* message)
-{
-    if (!m_EnableLog) return;
-    
-    std::lock_guard<std::mutex> lock(m_LogMutex);
-    
-    // Открываем файл если не открыт
-    if (!m_LogFile.is_open()) {
-        m_LogFile.open(m_LogPath, std::ios::app);
-        if (!m_LogFile.is_open()) return;
-    }
-    
-    // Добавляем временную метку
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-    
-    m_LogFile << "[" 
-              << st.wHour << ":" << st.wMinute << ":" << st.wSecond << "." 
-              << st.wMilliseconds << "] " 
-              << message << std::endl;
-    m_LogFile.flush();
+    return METHODS_COUNT;
 }
 
 long ADBFileDriver::FindMethod(const WCHAR_T* wsMethodName)
 {
-    (void)wsMethodName;
-    return -1; // Методов нет
+    wchar_t* methodName = nullptr;
+    convFromShortWchar(&methodName, wsMethodName);
+    std::wstring wName(methodName);
+    delete[] methodName;
+
+    for (int i = 0; i < METHODS_COUNT; i++) {
+        if (wcscmp(g_MethodNamesEN[i], wName.c_str()) == 0) return i;
+        if (wcscmp(g_MethodNamesRU[i], wName.c_str()) == 0) return i;
+    }
+    return -1;
 }
 
 const WCHAR_T* ADBFileDriver::GetMethodName(const long lMethodNum, const long lMethodAlias)
 {
-    (void)lMethodNum;
-    (void)lMethodAlias;
-    return nullptr; // Методов нет
+    if (lMethodNum < 0 || lMethodNum >= METHODS_COUNT) return nullptr;
+
+    const wchar_t* currentName = (lMethodAlias == 0) ? g_MethodNamesEN[lMethodNum] : g_MethodNamesRU[lMethodNum];
+    WCHAR_T* result = nullptr;
+    size_t len = wcslen(currentName) + 1;
+
+    if (m_iMemory && m_iMemory->AllocMemory((void**)&result, (unsigned long)(len * sizeof(WCHAR_T)))) {
+        convToShortWchar(&result, currentName, (uint32_t)len);
+    }
+    return result;
 }
 
 long ADBFileDriver::GetNParams(const long lMethodNum)
@@ -280,24 +275,86 @@ bool ADBFileDriver::GetParamDefValue(const long lMethodNum, const long lParamNum
 bool ADBFileDriver::HasRetVal(const long lMethodNum)
 {
     (void)lMethodNum;
-    return false;
+    return true;
 }
 
 bool ADBFileDriver::CallAsProc(const long lMethodNum, tVariant* paParams, const long lSizeArray)
 {
-    (void)lMethodNum;
-    (void)paParams;
-    (void)lSizeArray;
-    return false;
+    tVariant retValue;
+    tVarInit(&retValue);
+    return CallAsFunc(lMethodNum, &retValue, paParams, lSizeArray);
 }
 
 bool ADBFileDriver::CallAsFunc(const long lMethodNum, tVariant* pvarRetValue, tVariant* paParams, const long lSizeArray)
 {
-    (void)lMethodNum;
-    (void)pvarRetValue;
     (void)paParams;
     (void)lSizeArray;
-    return false;
+    
+    try {
+        TV_VT(pvarRetValue) = VTYPE_BOOL;
+        
+        switch (lMethodNum) {
+            case 0: // Connect - Подключить
+            {
+                wcscpy_s(m_Status, 512, L"Подключено");
+                m_bConnected = true;
+                LogWrite(L"Подключение выполнено");
+                TV_BOOL(pvarRetValue) = VARIANT_TRUE;
+                return true;
+            }
+            case 1: // Disconnect - Отключить
+            {
+                if (m_bConnected) {
+                    wcscpy_s(m_Status, 512, L"Не подключен");
+                    m_bConnected = false;
+                    LogWrite(L"Отключение выполнено");
+                }
+                TV_BOOL(pvarRetValue) = VARIANT_TRUE;
+                return true;
+            }
+            default:
+                TV_BOOL(pvarRetValue) = VARIANT_FALSE;
+                return false;
+        }
+    } catch (...) {
+        if (m_iConnect) {
+            EXCEPINFO info;
+            ZeroMemory(&info, sizeof(EXCEPINFO));
+            info.wCode = ADDIN_E_FAIL;
+            info.bstrSource = SysAllocString(L"ADBFileDriver");
+            info.bstrDescription = SysAllocString(L"Ошибка выполнения метода");
+            info.scode = E_FAIL;
+            m_iConnect->AddError(info.wCode, info.bstrSource, info.bstrDescription, info.scode);
+            SysFreeString(info.bstrSource);
+            SysFreeString(info.bstrDescription);
+        }
+        TV_VT(pvarRetValue) = VTYPE_BOOL;
+        TV_BOOL(pvarRetValue) = VARIANT_FALSE;
+        return false;
+    }
+}
+
+// ===== Логирование =====
+
+void ADBFileDriver::LogWrite(const wchar_t* message)
+{
+    if (!m_EnableLog) return;
+    
+    std::lock_guard<std::mutex> lock(m_LogMutex);
+    
+    if (!m_LogFile.is_open()) {
+        m_LogFile.open(m_LogPath, std::ios::app);
+        if (!m_LogFile.is_open()) return;
+    }
+    
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    
+    m_LogFile << "[" 
+              << st.wHour << ":" << st.wMinute << ":" << st.wSecond << "." 
+              << st.wMilliseconds << "] " 
+              << message << std::endl;
+    m_LogFile.flush();
 }
 
 // ===== LocaleBase =====
@@ -383,7 +440,7 @@ AppCapabilities SetPlatformCapabilities(const AppCapabilities capabilities)
 
 long GetAttachType()
 {
-    return 0; // eCanAttachAny
+    return 0;
 }
 
 } // extern "C"
