@@ -42,19 +42,42 @@ static bool LoadAdbFunctions()
 {
     if (g_AdbWinUsbHandle != nullptr) return true;
     
-    g_AdbWinUsbHandle = LoadLibraryW(L"AdbWinUsbApi.dll");
-    if (g_AdbWinUsbHandle == nullptr) {
-        // Пробуем из папки adb
-        wchar_t modulePath[MAX_PATH];
-        if (GetModuleFileNameW(nullptr, modulePath, MAX_PATH)) {
-            wchar_t* backslash = wcsrchr(modulePath, L'\\');
+    // Пробуем загрузить из нескольких мест
+    const wchar_t* searchPaths[] = {
+        L"AdbWinUsbApi.dll",                                    // System32/SysWOW64
+        NULL
+    };
+    
+    for (int i = 0; i < 2; i++) {
+        g_AdbWinUsbHandle = LoadLibraryW(searchPaths[i]);
+        if (g_AdbWinUsbHandle != nullptr) {
+            goto load_functions;
+        }
+    }
+    
+    // Пробуем из папки adb в текущей директории
+    {
+        wchar_t currentDir[MAX_PATH];
+        GetCurrentDirectoryW(MAX_PATH, currentDir);
+        wchar_t path[MAX_PATH];
+        wchar_t* backslash = wcsrchr(currentDir, L'\\');
+        if (backslash) {
+            wcscpy_s(backslash + 1, MAX_PATH - (backslash - currentDir), L"adb\\AdbWinUsbApi.dll");
+            wcscpy_s(path, MAX_PATH, currentDir);
+            backslash = wcsrchr(path, L'\\');
             if (backslash) {
-                wcscpy_s(backslash + 1, MAX_PATH - (backslash - modulePath), L"adb\\AdbWinUsbApi.dll");
-                g_AdbWinUsbHandle = LoadLibraryW(modulePath);
+                wcscpy_s(backslash + 1, MAX_PATH - (backslash - path), L"adb\\AdbWinUsbApi.dll");
+                g_AdbWinUsbHandle = LoadLibraryW(path);
+                if (g_AdbWinUsbHandle != nullptr) {
+                    goto load_functions;
+                }
             }
         }
     }
-    if (g_AdbWinUsbHandle == nullptr) return false;
+    
+    return false;
+    
+load_functions:
     
     pAdbEnumInterfaces = (AdbEnumInterfaces_t)GetProcAddress(g_AdbWinUsbHandle, "AdbEnumInterfaces");
     pAdbNextInterface = (AdbNextInterface_t)GetProcAddress(g_AdbWinUsbHandle, "AdbNextInterface");
@@ -201,7 +224,11 @@ bool ADBFileDriver::GetPropVal(const long lPropNum, tVariant* pvarPropVal)
             case 1: // EnableLog
             {
                 TV_VT(pvarPropVal) = VTYPE_BOOL;
-                TV_BOOL(pvarPropVal) = m_EnableLog ? VARIANT_TRUE : VARIANT_FALSE;
+                if (m_EnableLog) {
+                    TV_BOOL(pvarPropVal) = VARIANT_TRUE;
+                } else {
+                    TV_BOOL(pvarPropVal) = VARIANT_FALSE;
+                }
                 return true;
             }
             case 2: // LogPath
