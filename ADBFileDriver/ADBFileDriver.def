@@ -1,0 +1,8 @@
+LIBRARY
+
+EXPORTS
+    GetClassNames @1
+    GetClassObject @2
+    DestroyObject @3
+    SetPlatformCapabilities @4
+    GetAttachType @5
