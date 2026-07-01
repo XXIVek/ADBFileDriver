@@ -5,9 +5,9 @@
 #include "ADBFileDriver.h"
 
 // Глобальные массивы имен свойств
-static const wchar_t* g_PropNamesEN[] = { L"Version" };
-static const wchar_t* g_PropNamesRU[] = { L"Версия" };
-#define PROPS_COUNT 1
+static const wchar_t* g_PropNamesEN[] = { L"Version", L"EnableLog", L"LogPath" };
+static const wchar_t* g_PropNamesRU[] = { L"Версия", L"ВключитьЛогирование", L"ПутьДляФайлаЛогирования" };
+#define PROPS_COUNT 3
 
 // Глобальные массивы имен методов (пусто для MVP)
 #define METHODS_COUNT 0
@@ -17,7 +17,10 @@ static const wchar_t* g_PropNamesRU[] = { L"Версия" };
 
 ADBFileDriver::ADBFileDriver(void)
     : m_iConnect(nullptr), m_iMemory(nullptr), m_bInitialized(false)
+    , m_EnableLog(false)
 {
+    // Инициализация пути логирования по умолчанию (временная папка)
+    ExpandEnvironmentStringsW(L"%TEMP%\\ADBFileDriver.log", m_LogPath, 512);
 }
 
 ADBFileDriver::~ADBFileDriver()
@@ -50,6 +53,14 @@ long ADBFileDriver::GetInfo()
 
 void ADBFileDriver::Done()
 {
+    // Закрытие лог файла
+    {
+        std::lock_guard<std::mutex> lock(m_LogMutex);
+        if (m_LogFile.is_open()) {
+            m_LogFile.close();
+        }
+    }
+    
     if (m_iConnect) {
         m_iConnect = nullptr;
     }
@@ -63,7 +74,7 @@ void ADBFileDriver::Done()
 
 long ADBFileDriver::GetNProps()
 {
-    return PROPS_COUNT; // Одно свойство: Версия
+    return PROPS_COUNT; // Версия, ВключитьЛогирование, ПутьДляФайлаЛогирования
 }
 
 long ADBFileDriver::FindProp(const WCHAR_T* wsPropName)
@@ -153,6 +164,31 @@ bool ADBFileDriver::IsPropWritable(const long lPropNum)
 long ADBFileDriver::GetNMethods()
 {
     return METHODS_COUNT; // Нет методов в MVP
+}
+
+// ===== Логирование =====
+
+void ADBFileDriver::LogWrite(const wchar_t* message)
+{
+    if (!m_EnableLog) return;
+    
+    std::lock_guard<std::mutex> lock(m_LogMutex);
+    
+    // Открываем файл если не открыт
+    if (!m_LogFile.is_open()) {
+        m_LogFile.open(m_LogPath, std::ios::app);
+        if (!m_LogFile.is_open()) return;
+    }
+    
+    // Добавляем временную метку
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    
+    m_LogFile << "[" 
+              << st.wHour << ":" << st.wMinute << ":" << st.wSecond << "." 
+              << st.wMilliseconds << "] " 
+              << message << std::endl;
+    m_LogFile.flush();
 }
 
 long ADBFileDriver::FindMethod(const WCHAR_T* wsMethodName)

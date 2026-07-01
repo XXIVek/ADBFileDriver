@@ -9,6 +9,8 @@
 #include <wchar.h>
 #include <string>
 #include <locale>
+#include <fstream>
+#include <mutex>
 
 ///////////////////////////////////////////////////////////////////////////////
 // class ADBFileDriver
@@ -18,6 +20,8 @@ public:
     enum Props
     {
         epVersion,
+        epEnableLog,
+        epLogPath,
         epLast      
     };
 
@@ -61,6 +65,9 @@ public:
     virtual void ADDIN_API SetLocale(const WCHAR_T* loc);
     virtual bool ADDIN_API RegisterExtensionAs(WCHAR_T**);
 
+    // Логирование
+    void LogWrite(const wchar_t* message);
+
 private:
     long findName(const wchar_t* names[], const wchar_t* name, const uint32_t size) const;
     void addError(uint32_t wcode, const wchar_t* source, const wchar_t* descriptor, long code);
@@ -69,6 +76,12 @@ private:
     IAddInDefBase      *m_iConnect;
     IMemoryManager     *m_iMemory;
     bool                m_bInitialized;
+
+    // Параметры логирования
+    bool                m_EnableLog;
+    wchar_t             m_LogPath[512];
+    std::ofstream       m_LogFile;
+    std::mutex          m_LogMutex;
 };
 
 class WcharWrapper
