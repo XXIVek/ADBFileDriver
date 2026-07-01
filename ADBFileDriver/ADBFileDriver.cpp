@@ -29,7 +29,15 @@ ADBFileDriver::ADBFileDriver(void)
 
 ADBFileDriver::~ADBFileDriver()
 {
-    Done();
+    // Безопасное уничтожение - без использования std::lock_guard
+    if (m_LogFile.is_open()) {
+        try {
+            m_LogFile << "Компонента деинициализирована" << std::endl;
+            m_LogFile.close();
+        } catch (...) {
+            // Игнорируем ошибки при уничтожении
+        }
+    }
 }
 
 // ===== IInitDoneBase =====
@@ -58,12 +66,12 @@ long ADBFileDriver::GetInfo()
 
 void ADBFileDriver::Done()
 {
-    // Закрытие лог файла
-    {
-        std::lock_guard<std::mutex> lock(m_LogMutex);
-        if (m_LogFile.is_open()) {
+    // Закрытие лог файла (без lock_guard для безопасности)
+    if (m_LogFile.is_open()) {
+        try {
             m_LogFile << "Компонента деинициализирована" << std::endl;
             m_LogFile.close();
+        } catch (...) {
         }
     }
     
@@ -173,11 +181,8 @@ bool ADBFileDriver::SetPropVal(const long lPropNum, tVariant* varPropVal)
                         LogWrite(L"Логирование включено");
                     } else {
                         LogWrite(L"Логирование выключено");
-                        {
-                            std::lock_guard<std::mutex> lock(m_LogMutex);
-                            if (m_LogFile.is_open()) {
-                                m_LogFile.close();
-                            }
+                        if (m_LogFile.is_open()) {
+                            m_LogFile.close();
                         }
                     }
                 }
@@ -340,21 +345,25 @@ void ADBFileDriver::LogWrite(const wchar_t* message)
 {
     if (!m_EnableLog) return;
     
-    std::lock_guard<std::mutex> lock(m_LogMutex);
-    
-    if (!m_LogFile.is_open()) {
-        m_LogFile.open(m_LogPath, std::ios::app);
-        if (!m_LogFile.is_open()) return;
+    // Простая блокировка без lock_guard для безопасности
+    try {
+        // Критическая секция
+        if (!m_LogFile.is_open()) {
+            m_LogFile.open(m_LogPath, std::ios::app);
+            if (!m_LogFile.is_open()) return;
+        }
+        
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        
+        m_LogFile << "[" 
+                  << st.wHour << ":" << st.wMinute << ":" << st.wSecond << "." 
+                  << st.wMilliseconds << "] " 
+                  << message << std::endl;
+        m_LogFile.flush();
+    } catch (...) {
+        // Игнорируем ошибки логирования
     }
-    
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-    
-    m_LogFile << "[" 
-              << st.wHour << ":" << st.wMinute << ":" << st.wSecond << "." 
-              << st.wMilliseconds << "] " 
-              << message << std::endl;
-    m_LogFile.flush();
 }
 
 // ===== LocaleBase =====
