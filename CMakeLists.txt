@@ -69,12 +69,18 @@ if(MSVC)
     target_compile_options(ADBFileDriver_Win32 PRIVATE /utf-8 /EHsc)
 
     # Библиотеки для линковки
-    target_link_libraries(ADBFileDriver_Win64 ole32.lib oleaut32.lib shlwapi.lib advapi32.lib)
-    target_link_libraries(ADBFileDriver_Win32 ole32.lib oleaut32.lib shlwapi.lib advapi32.lib)
+    target_link_libraries(ADBFileDriver_Win64 ole32.lib oleaut32.lib shlwapi.lib shell32.lib advapi32.lib comctl32.lib)
+    target_link_libraries(ADBFileDriver_Win32 ole32.lib oleaut32.lib shlwapi.lib shell32.lib advapi32.lib comctl32.lib)
 
     # Оптимизация для Release
     target_compile_options(ADBFileDriver_Win64 PRIVATE /O2)
     target_compile_options(ADBFileDriver_Win32 PRIVATE /O2)
+    
+    # Debug настройки
+    target_compile_options(ADBFileDriver_Win64 PRIVATE $<$<CONFIG:DEBUG>:/Od /Zi /D_DEBUG>)
+    target_compile_options(ADBFileDriver_Win32 PRIVATE $<$<CONFIG:DEBUG>:/Od /Zi /D_DEBUG>)
+    target_link_options(ADBFileDriver_Win64 PRIVATE $<$<CONFIG:DEBUG>:/DEBUG>)
+    target_link_options(ADBFileDriver_Win32 PRIVATE $<$<CONFIG:DEBUG>:/DEBUG>)
 endif()
 
 # ========== MANIFEST.XML КОПИРОВАНИЕ ==========

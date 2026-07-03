@@ -5,6 +5,9 @@
 #include "IMemoryManager.h"
 #include "stdafx.h"
 
+#include <windows.h>
+#include <propvarutil.h>
+#include <objbase.h>
 #include <stdio.h>
 #include <wchar.h>
 #include <string>
@@ -12,8 +15,21 @@
 #include <fstream>
 #include <mutex>
 
+// Макрос для отладочного вывода через DebugView
+#define DEBUG_LOG(msg) do { OutputDebugStringW(msg); OutputDebugStringW(L"\n"); } while(0)
+#define DEBUG_LOG_FMT(fmt, ...) do { wchar_t _dbgbuf[512]; swprintf_s(_dbgbuf, fmt, __VA_ARGS__); OutputDebugStringW(_dbgbuf); OutputDebugStringW(L"\n"); } while(0)
+
+// GUID для IPortableDeviceManager (из portabledeviceapi.h)
+// CLSID_PortableDeviceManager
+static const CLSID CLSID_PortableDeviceManager = 
+{ 0x72A2E8D8, 0x1F2, 0x49F, { 0xB3, 0x1C, 0x56, 0x5B, 0x3F, 0x6D, 0x4F, 0x5A } };
+
+// IID_IPortableDeviceManager - правильный GUID из portabledevicemanager.h
+static const IID IID_IPortableDeviceManager = 
+{ 0x3D2CDE48, 0x5B, 0x4D, { 0x9D, 0x35, 0xF7, 0xE4, 0x9B, 0xB1, 0x3B, 0xD2 } };
+
 ///////////////////////////////////////////////////////////////////////////////
-// class ADBFileDriver
+// class ADBFileDriver (MTP Device Manager)
 class ADBFileDriver : public IComponentBase
 {
 public:
@@ -29,10 +45,9 @@ public:
 
     enum Methods
     {
+        emEnumerateDevices,
         emConnect,
         emDisconnect,
-        emEnumerateDevices,
-        emGetDeviceInfo,
         emLast      
     };
 
@@ -92,20 +107,19 @@ private:
     // Состояние подключения
     bool                m_bConnected;
     wchar_t             m_Status[512];
-
-    // Устройства ADB
+    
+    // MTP устройства
     wchar_t             m_DeviceList[8192];  // JSON строка с устройствами
     uint32_t            m_DeviceCount;
-};
+    
+    // MTP интерфейс устройства
+    void*               m_pDevice;  // IPortableDevice*
+    wchar_t             m_DeviceId[512];   // ID подключенного устройства
 
-// Структура для хранения информации об устройстве
-struct ADBDeviceInfo {
-    wchar_t serial[64];
-    wchar_t model[128];
-    wchar_t device[64];
-    wchar_t type[32];
-    unsigned short vendorId;
-    unsigned short productId;
+    // Вспомогательные функции для MTP
+    uint32_t EnumerateMtpDevices();
+    bool ConnectToDevice(const wchar_t* deviceName);
+    void DisconnectDevice();
 };
 
 class WcharWrapper

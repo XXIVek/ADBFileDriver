@@ -1,7 +1,0 @@
-LIBRARY    "innNative"
-
-EXPORTS
-GetClassObject
-DestroyObject
-GetClassNames
-SetPlatformCapabilities

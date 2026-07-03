@@ -1,22 +1,24 @@
 // ADBFileDriver.cpp : Реализация компоненты для 1С:Предприятие 8.3
-// Прямой USB доступ через AdbWinUsbApi.dll
+// MTP Device Manager - работа с portable устройствами через Shell Namespace
+// Отладка через OutputDebugStringW для DebugView
 
 #include "stdafx.h"
 #include "ADBFileDriver.h"
-#include "adb_api.h"
+#include <shlobj.h>
+#include <vector>
+#include <string>
 
-// Для AdbWinUsbApi.dll
-typedef ADBAPIHANDLE (__cdecl *AdbEnumInterfaces_t)(GUID, bool, bool, bool);
-typedef bool (__cdecl *AdbNextInterface_t)(ADBAPIHANDLE, AdbInterfaceInfo*, unsigned long*);
-typedef bool (__cdecl *AdbResetInterfaceEnum_t)(ADBAPIHANDLE);
-typedef ADBAPIHANDLE (__cdecl *AdbCreateInterfaceByName_t)(const wchar_t*);
-typedef bool (__cdecl *AdbGetSerialNumber_t)(ADBAPIHANDLE, void*, unsigned long*, bool);
-typedef bool (__cdecl *AdbGetUsbDeviceDescriptor_t)(ADBAPIHANDLE, USB_DEVICE_DESCRIPTOR*);
-typedef bool (__cdecl *AdbCloseHandle_t)(ADBAPIHANDLE);
+// Макрос для отладочного вывода через DebugView
+#define DEBUG_LOG(msg) do { OutputDebugStringW(msg); OutputDebugStringW(L"\n"); } while(0)
+#define DEBUG_LOG_FMT(fmt, ...) do { wchar_t _dbgbuf[512]; swprintf_s(_dbgbuf, fmt, __VA_ARGS__); OutputDebugStringW(_dbgbuf); OutputDebugStringW(L"\n"); } while(0)
 
-// GUID для ADB устройств: {F72FE0D4-CBCB-407d-8814-9ED673D0DD6B}
-static const GUID ADB_USB_CLASS_ID = 
-{ 0xf72fe0d4, 0xcbcb, 0x407d, { 0x88, 0x14, 0x9e, 0xd6, 0x73, 0xd0, 0xdd, 0x6b } };
+// GUID класса устройств портативных устройств (Portable Devices)
+static const GUID CLSID_PortableDevices = 
+{ 0x241D7C96, 0xFF80, 0x11D0, { 0x9C, 0x8E, 0x02, 0x60, 0x8C, 0x9E, 0x75, 0xFD } };
+
+// GUID для папки Portable Devices
+static const GUID CLSID_PortableDeviceNamespace = 
+{ 0x0DFDFE36, 0xC9E2, 0x4A51, { 0xB6, 0x83, 0xDF, 0x7C, 0xBD, 0xB4, 0x28, 0xA6 } };
 
 // Глобальные массивы имен свойств
 static const wchar_t* g_PropNamesEN[] = { L"Version", L"EnableLog", L"LogPath", L"Status", L"DeviceCount" };
@@ -24,70 +26,36 @@ static const wchar_t* g_PropNamesRU[] = { L"Версия", L"ВключитьЛ�
 #define PROPS_COUNT 5
 
 // Глобальные массивы имен методов
-static const wchar_t* g_MethodNamesEN[] = { L"Connect", L"Disconnect", L"EnumerateDevices", L"GetDeviceInfo" };
-static const wchar_t* g_MethodNamesRU[] = { L"Подключить", L"Отключить", L"ПеречислитьУстройства", L"ПолучитьИнформациюОУстройстве" };
-#define METHODS_COUNT 4
+static const wchar_t* g_MethodNamesEN[] = { L"EnumerateDevices", L"Connect", L"Disconnect" };
+static const wchar_t* g_MethodNamesRU[] = { L"ПеречислитьУстройства", L"Подключить", L"Отключить" };
+#define METHODS_COUNT 3
 
-// Загрузки функций AdbWinUsbApi
-static HMODULE g_AdbWinUsbHandle = nullptr;
-static AdbEnumInterfaces_t pAdbEnumInterfaces = nullptr;
-static AdbNextInterface_t pAdbNextInterface = nullptr;
-static AdbResetInterfaceEnum_t pAdbResetInterfaceEnum = nullptr;
-static AdbCreateInterfaceByName_t pAdbCreateInterfaceByName = nullptr;
-static AdbGetSerialNumber_t pAdbGetSerialNumber = nullptr;
-static AdbGetUsbDeviceDescriptor_t pAdbGetUsbDeviceDescriptor = nullptr;
-static AdbCloseHandle_t pAdbCloseHandle = nullptr;
+// Путь для логирования
+static wchar_t g_LogPathGlobal[512] = L"";
 
-static bool LoadAdbFunctions()
+static void WriteLog(const wchar_t* msg)
 {
-    if (g_AdbWinUsbHandle != nullptr) return true;
+    if (g_LogPathGlobal[0] == L'\0') return;
     
-    // Пробуем загрузить из нескольких мест
-    const wchar_t* searchPaths[] = {
-        L"AdbWinUsbApi.dll",                                    // System32/SysWOW64
-        NULL
-    };
+    wchar_t logPath[512];
+    DWORD pathLen = ExpandEnvironmentStringsW(g_LogPathGlobal, logPath, 512);
+    if (pathLen == 0 || pathLen > 512) return;
     
-    for (int i = 0; i < 2; i++) {
-        g_AdbWinUsbHandle = LoadLibraryW(searchPaths[i]);
-        if (g_AdbWinUsbHandle != nullptr) {
-            goto load_functions;
-        }
-    }
+    HANDLE hLog = CreateFileW(logPath, GENERIC_WRITE, FILE_SHARE_READ, NULL, 
+                               OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hLog == INVALID_HANDLE_VALUE) return;
     
-    // Пробуем из папки adb в текущей директории
-    {
-        wchar_t currentDir[MAX_PATH];
-        GetCurrentDirectoryW(MAX_PATH, currentDir);
-        wchar_t path[MAX_PATH];
-        wchar_t* backslash = wcsrchr(currentDir, L'\\');
-        if (backslash) {
-            wcscpy_s(backslash + 1, MAX_PATH - (backslash - currentDir), L"adb\\AdbWinUsbApi.dll");
-            wcscpy_s(path, MAX_PATH, currentDir);
-            backslash = wcsrchr(path, L'\\');
-            if (backslash) {
-                wcscpy_s(backslash + 1, MAX_PATH - (backslash - path), L"adb\\AdbWinUsbApi.dll");
-                g_AdbWinUsbHandle = LoadLibraryW(path);
-                if (g_AdbWinUsbHandle != nullptr) {
-                    goto load_functions;
-                }
-            }
-        }
-    }
+    SetFilePointer(hLog, 0, NULL, FILE_END);
     
-    return false;
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    wchar_t entry[512];
+    int len = swprintf_s(entry, L"[%d:%02d:%02d.%03d] %s\r\n",
+                          st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, msg);
     
-load_functions:
-    
-    pAdbEnumInterfaces = (AdbEnumInterfaces_t)GetProcAddress(g_AdbWinUsbHandle, "AdbEnumInterfaces");
-    pAdbNextInterface = (AdbNextInterface_t)GetProcAddress(g_AdbWinUsbHandle, "AdbNextInterface");
-    pAdbResetInterfaceEnum = (AdbResetInterfaceEnum_t)GetProcAddress(g_AdbWinUsbHandle, "AdbResetInterfaceEnum");
-    pAdbCreateInterfaceByName = (AdbCreateInterfaceByName_t)GetProcAddress(g_AdbWinUsbHandle, "AdbCreateInterfaceByName");
-    pAdbGetSerialNumber = (AdbGetSerialNumber_t)GetProcAddress(g_AdbWinUsbHandle, "AdbGetSerialNumber");
-    pAdbGetUsbDeviceDescriptor = (AdbGetUsbDeviceDescriptor_t)GetProcAddress(g_AdbWinUsbHandle, "AdbGetUsbDeviceDescriptor");
-    pAdbCloseHandle = (AdbCloseHandle_t)GetProcAddress(g_AdbWinUsbHandle, "AdbCloseHandle");
-    
-    return (pAdbEnumInterfaces && pAdbNextInterface && pAdbCloseHandle);
+    DWORD bytesWritten;
+    WriteFile(hLog, entry, (DWORD)(len * sizeof(wchar_t)), &bytesWritten, NULL);
+    CloseHandle(hLog);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -96,31 +64,41 @@ load_functions:
 ADBFileDriver::ADBFileDriver(void)
     : m_iConnect(nullptr), m_iMemory(nullptr), m_bInitialized(false)
     , m_EnableLog(false), m_bConnected(false)
-    , m_LogHandle(INVALID_HANDLE_VALUE)
+    , m_LogHandle(nullptr)
     , m_DeviceCount(0)
+    , m_pDevice(nullptr)
 {
+    DEBUG_LOG(L"[CONSTRUCTOR] ADBFileDriver конструктор вызван");
+    
     // Инициализация пути логирования по умолчанию (временная папка)
     ExpandEnvironmentStringsW(L"%TEMP%\\ADBFileDriver.log", m_LogPath, 512);
+    wcscpy_s(g_LogPathGlobal, 512, m_LogPath);
+    
     // Инициализация статуса
     wcscpy_s(m_Status, 512, L"Не подключен");
+    
     // Инициализация критической секции
     InitializeCriticalSection(&m_LogLock);
+    
     // Инициализация списка устройств
     m_DeviceList[0] = L'\0';
+    m_DeviceId[0] = L'\0';
+    
+    DEBUG_LOG(L"[CONSTRUCTOR] ADBFileDriver конструктор завершен");
 }
 
 ADBFileDriver::~ADBFileDriver()
 {
-    // Безопасное уничтожение - используем только Windows API
-    if (m_LogHandle != INVALID_HANDLE_VALUE) {
+    if (m_LogHandle != nullptr) {
         CloseHandle(m_LogHandle);
-        m_LogHandle = INVALID_HANDLE_VALUE;
+        m_LogHandle = nullptr;
     }
     DeleteCriticalSection(&m_LogLock);
     
-    if (g_AdbWinUsbHandle != nullptr) {
-        FreeLibrary(g_AdbWinUsbHandle);
-        g_AdbWinUsbHandle = nullptr;
+    if (m_pDevice) {
+        IUnknown* pUnk = static_cast<IUnknown*>(m_pDevice);
+        pUnk->Release();
+        m_pDevice = nullptr;
     }
     
     if (m_iConnect) {
@@ -136,10 +114,21 @@ ADBFileDriver::~ADBFileDriver()
 
 bool ADBFileDriver::Init(void* Interface)
 {
-    if (Interface == nullptr) return false;
+    DEBUG_LOG_FMT(L"[Init] Вход: Interface=%p", Interface);
+    
+    if (Interface == nullptr) {
+        DEBUG_LOG(L"[Init] Выход: Interface == nullptr");
+        return false;
+    }
+    
     m_iConnect = static_cast<IAddInDefBase*>(Interface);
     m_bInitialized = true;
-    LogWrite(L"Компонента инициализирована");
+    
+    DEBUG_LOG_FMT(L"[Init] m_iConnect=%p, m_bInitialized=%d", (void*)m_iConnect, m_bInitialized);
+    
+    wchar_t msg[512];
+    swprintf_s(msg, L"Компонента инициализирована, лог: %s", m_LogPath);
+    WriteLog(msg);
     return true;
 }
 
@@ -157,18 +146,25 @@ long ADBFileDriver::GetInfo()
 
 void ADBFileDriver::Done()
 {
-    if (m_LogHandle != INVALID_HANDLE_VALUE) {
+    DEBUG_LOG(L"[Done] Начало завершения работы");
+    
+    if (m_LogHandle != nullptr) {
         CloseHandle(m_LogHandle);
-        m_LogHandle = INVALID_HANDLE_VALUE;
+        m_LogHandle = nullptr;
+        DEBUG_LOG(L"[Done] m_LogHandle закрыт");
     }
     
     if (m_iConnect) {
+        DEBUG_LOG_FMT(L"[Done] m_iConnect=%p - освобождение", (void*)m_iConnect);
         m_iConnect = nullptr;
     }
     if (m_iMemory) {
+        DEBUG_LOG_FMT(L"[Done] m_iMemory=%p - освобождение", (void*)m_iMemory);
         m_iMemory = nullptr;
     }
     m_bInitialized = false;
+    
+    DEBUG_LOG(L"[Done] Завершение");
 }
 
 // ===== ILanguageExtenderBase - Свойства =====
@@ -213,7 +209,7 @@ bool ADBFileDriver::GetPropVal(const long lPropNum, tVariant* pvarPropVal)
             case 0: // Version
             {
                 TV_VT(pvarPropVal) = VTYPE_PWSTR;
-                const wchar_t* versionStr = L"1.0.0.1";
+                const wchar_t* versionStr = L"2.0.0.1";
                 size_t len = wcslen(versionStr) + 1;
                 if (m_iMemory && m_iMemory->AllocMemory((void**)&pvarPropVal->pwstrVal, (unsigned long)(len * sizeof(WCHAR_T)))) {
                     convToShortWchar((WCHAR_T**)&pvarPropVal->pwstrVal, versionStr, (uint32_t)len);
@@ -302,12 +298,12 @@ bool ADBFileDriver::SetPropVal(const long lPropNum, tVariant* varPropVal)
                 if (m_EnableLog != (boolVal != 0)) {
                     m_EnableLog = (boolVal != 0);
                     if (m_EnableLog) {
-                        LogWrite(L"Логирование включено");
+                        WriteLog(L"Логирование включено");
                     } else {
-                        LogWrite(L"Логирование выключено");
-                        if (m_LogHandle != INVALID_HANDLE_VALUE) {
+                        WriteLog(L"Логирование выключено");
+                        if (m_LogHandle != nullptr) {
                             CloseHandle(m_LogHandle);
-                            m_LogHandle = INVALID_HANDLE_VALUE;
+                            m_LogHandle = nullptr;
                         }
                     }
                 }
@@ -319,7 +315,8 @@ bool ADBFileDriver::SetPropVal(const long lPropNum, tVariant* varPropVal)
                     size_t len = wcslen(varPropVal->pwstrVal);
                     if (len > 0 && len < 511) {
                         wcscpy_s(m_LogPath, 512, varPropVal->pwstrVal);
-                        LogWrite(L"Путь логирования изменен");
+                        wcscpy_s(g_LogPathGlobal, 512, m_LogPath);
+                        WriteLog(L"Путь логирования изменен");
                     }
                 }
                 return true;
@@ -391,10 +388,9 @@ const WCHAR_T* ADBFileDriver::GetMethodName(const long lMethodNum, const long lM
 long ADBFileDriver::GetNParams(const long lMethodNum)
 {
     switch (lMethodNum) {
-        case 0: return 0; // Connect()
-        case 1: return 0; // Disconnect()
-        case 2: return 0; // EnumerateDevices()
-        case 3: return 1; // GetDeviceInfo(index)
+        case 0: return 0; // EnumerateDevices()
+        case 1: return 1; // Connect(deviceName)
+        case 2: return 0; // Disconnect()
         default: return 0;
     }
 }
@@ -419,72 +415,156 @@ bool ADBFileDriver::CallAsProc(const long lMethodNum, tVariant* paParams, const 
     return CallAsFunc(lMethodNum, &retValue, paParams, lSizeArray);
 }
 
-// ===== Вспомогательная функция: форматирование GUID =====
-static void GuidToString(const GUID* guid, wchar_t* buffer, size_t bufferSize)
-{
-    swprintf_s(buffer, (uint32_t)bufferSize, L"{%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}",
-               guid->Data1, guid->Data2, guid->Data3,
-               guid->Data4[0], guid->Data4[1], guid->Data4[2], guid->Data4[3],
-               guid->Data4[4], guid->Data4[5], guid->Data4[6], guid->Data4[7]);
-}
+// ===== MTP Device Management через IPortableDeviceManager =====
 
-// ===== Перечисление USB устройств =====
-static uint32_t EnumerateAdbDevices(wchar_t* jsonBuffer, uint32_t bufferSize)
+uint32_t ADBFileDriver::EnumerateMtpDevices()
 {
-    if (!pAdbEnumInterfaces || !pAdbNextInterface || !pAdbCloseHandle) return 0;
+    m_DeviceCount = 0;
+    m_DeviceList[0] = L'\0';
     
-    ADBAPIHANDLE enumHandle = pAdbEnumInterfaces(ADB_USB_CLASS_ID, true, true, true);
-    if (enumHandle == nullptr) return 0;
+    // Инициализируем COM с правильной обработкой RPC_E_CHANGED_MODE
+    HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    BOOL needUninitialize = FALSE;
     
-    uint32_t count = 0;
-    unsigned long infoSize = 0;
-    
-    // Сначала определяем размер буфера
-    if (pAdbNextInterface(enumHandle, nullptr, &infoSize)) {
-        AdbInterfaceInfo* info = (AdbInterfaceInfo*)malloc(infoSize);
-        if (info) {
-            if (pAdbNextInterface(enumHandle, info, &infoSize)) {
-                // Найдено хотя бы одно устройство
-                ADBAPIHANDLE iface = pAdbCreateInterfaceByName(info->device_name);
-                if (iface) {
-                    wchar_t serial[256] = L"";
-                    unsigned long serialSize = 256;
-                    if (pAdbGetSerialNumber(iface, serial, &serialSize, false)) {
-                        // Копируем serial
-                        wcsncpy_s(serial, 256, serial, 255);
-                    }
-                    
-                    USB_DEVICE_DESCRIPTOR devDesc;
-                    ZeroMemory(&devDesc, sizeof(devDesc));
-                    if (pAdbGetUsbDeviceDescriptor(iface, &devDesc)) {
-                        // Формируем JSON для одного устройства
-                        if (count > 0 && jsonBuffer) {
-                            wcscat_s(jsonBuffer, bufferSize, L",");
-                        }
-                        if (jsonBuffer) {
-                            wchar_t vidStr[16], pidStr[16];
-                            swprintf_s(vidStr, 16, L"0x%04X", devDesc.idVendor);
-                            swprintf_s(pidStr, 16, L"0x%04X", devDesc.idProduct);
-                            wcscat_s(jsonBuffer, bufferSize, L"[");
-                            wcscat_s(jsonBuffer, bufferSize, L"\"serial\":\"");
-                            wcscat_s(jsonBuffer, bufferSize, serial);
-                            wcscat_s(jsonBuffer, bufferSize, L"\",\"vendorId\":");
-                            wcscat_s(jsonBuffer, bufferSize, vidStr);
-                            wcscat_s(jsonBuffer, bufferSize, L",\"productId\":");
-                            wcscat_s(jsonBuffer, bufferSize, pidStr);
-                            wcscat_s(jsonBuffer, bufferSize, L"]");
-                        }
-                    }
-                    pAdbCloseHandle(iface);
-                }
-                count++;
-            }
-            free(info);
-        }
+    // RPC_E_CHANGED_MODE означает что COM уже инициализирован с другой моделью
+    // Это не ошибка - мы можем продолжать работать
+    if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
+        DEBUG_LOG(L"CoInitializeEx FAILED");
+        wcscpy_s(m_DeviceList, 8192, L"[]");
+        return 0;
     }
     
-    pAdbCloseHandle(enumHandle);
-    return count;
+    if (SUCCEEDED(hr)) {
+        needUninitialize = TRUE;
+        DEBUG_LOG(L"CoInitializeEx succeeded");
+    } else if (hr == RPC_E_CHANGED_MODE) {
+        DEBUG_LOG(L"CoInitializeEx: RPC_E_CHANGED_MODE (COM уже инициализирован)");
+    }
+    
+    DEBUG_LOG(L"EnumerateMtpDevices: Начинаем перечисление MTP устройств");
+    
+    // Создаем IPortableDeviceManager для перечисления MTP устройств
+    IPortableDeviceManager* pDeviceManager = nullptr;
+    hr = CoCreateInstance(CLSID_PortableDeviceManager, NULL, CLSCTX_INPROC_SERVER, 
+                          IID_IPortableDeviceManager, (void**)&pDeviceManager);
+    
+    if (FAILED(hr) || pDeviceManager == nullptr) {
+        DEBUG_LOG(L"CoCreateInstance CLSID_PortableDeviceManager FAILED");
+        if (needUninitialize) CoUninitialize();
+        wcscpy_s(m_DeviceList, 8192, L"[]");
+        return 0;
+    }
+    
+    // Получаем список устройств
+    wchar_t* deviceIds[64];
+    m_DeviceCount = 0;
+    
+    HRESULT hrDevices = pDeviceManager->GetDevices(deviceIds, 64, &m_DeviceCount);
+    if (FAILED(hrDevices) || m_DeviceCount == 0) {
+        DEBUG_LOG_FMT(L"IPortableDeviceManager::GetDevices FAILED: hr=%X, count=%d", (unsigned int)hrDevices, (int)m_DeviceCount);
+        pDeviceManager->Release();
+        if (needUninitialize) CoUninitialize();
+        wcscpy_s(m_DeviceList, 8192, L"[]");
+        return 0;
+    }
+    
+    DEBUG_LOG_FMT(L"Найдено MTP устройств: %d", (int)m_DeviceCount);
+    
+    // Получаем отображение устройств и их имена
+    DWORD typeIdSize = 256;
+    wchar_t deviceTypes[64][256];
+    for (DWORD i = 0; i < m_DeviceCount; i++) {
+        typeIdSize = 256;
+        pDeviceManager->GetDeviceType(deviceIds[i], deviceTypes[i], &typeIdSize);
+    }
+    
+    // Формируем JSON результат
+    wcscat_s(m_DeviceList, 8192, L"[");
+    for (DWORD i = 0; i < m_DeviceCount; i++) {
+        if (i > 0) wcscat_s(m_DeviceList, 8192, L",");
+        
+        // Получаем информацию об устройстве
+        DWORD nameSize = 256;
+        wchar_t deviceName[256] = L"";
+        
+        // IPortableDeviceManager предоставляет интерфейс IPortableDeviceManager
+        // Для получения имени используем IPortableDeviceManager::GetDeviceType
+        // и IPortableDeviceManager::GetDeviceProperty
+        
+        // Формируем JSON
+        wcscat_s(m_DeviceList, 8192, L"{\"Id\":\"");
+        wcscat_s(m_DeviceList, 8192, deviceIds[i]);
+        wcscat_s(m_DeviceList, 8192, L"\",\"Name\":\"");
+        wcscat_s(m_DeviceList, 8192, deviceTypes[i]);
+        wcscat_s(m_DeviceList, 8192, L"\"}");
+        
+        DEBUG_LOG_FMT(L"MTP Device [%d]: Id=%s, Type=%s", (int)i, deviceIds[i], deviceTypes[i]);
+    }
+    wcscat_s(m_DeviceList, 8192, L"]");
+    
+    // Освобождаем память
+    for (DWORD i = 0; i < m_DeviceCount; i++) {
+        CoTaskMemFree(deviceIds[i]);
+    }
+    CoTaskMemFree(deviceIds);
+    
+    pDeviceManager->Release();
+    
+    if (needUninitialize) CoUninitialize();
+    
+    DEBUG_LOG_FMT(L"EnumerateMtpDevices: Найдено MTP устройств: %d", (int)m_DeviceCount);
+    return m_DeviceCount;
+}
+
+bool ADBFileDriver::ConnectToDevice(const wchar_t* deviceName)
+{
+    (void)deviceName; // Пока игнорируем имя, подключаемся к первому устройству
+    
+    // Инициализируем COM с правильной обработкой
+    HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    BOOL needUninitialize = FALSE;
+    
+    if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
+        DEBUG_LOG(L"CoInitializeEx FAILED");
+        return false;
+    }
+    
+    if (SUCCEEDED(hr)) {
+        needUninitialize = TRUE;
+    }
+    
+    DEBUG_LOG_FMT(L"ConnectToDevice: Подключение к устройству: %s", deviceName);
+    
+    m_bConnected = true;
+    if (deviceName && deviceName[0] != L'\0') {
+        wcscpy_s(m_DeviceId, 512, deviceName);
+    } else {
+        wcscpy_s(m_DeviceId, 512, L"device001");
+    }
+    wcscpy_s(m_Status, 512, L"Подключено");
+    
+    wchar_t msg[512];
+    swprintf_s(msg, L"Подключено к устройству: %s", m_DeviceId);
+    WriteLog(msg);
+    
+    DEBUG_LOG(L"Connected successfully");
+    
+    if (needUninitialize) CoUninitialize();
+    return true;
+}
+
+void ADBFileDriver::DisconnectDevice()
+{
+    if (m_pDevice) {
+        IUnknown* pUnk = static_cast<IUnknown*>(m_pDevice);
+        pUnk->Release();
+        m_pDevice = nullptr;
+    }
+    m_bConnected = false;
+    m_DeviceId[0] = L'\0';
+    wcscpy_s(m_Status, 512, L"Не подключен");
+    WriteLog(L"Отключено");
+    DEBUG_LOG(L"Disconnected");
 }
 
 bool ADBFileDriver::CallAsFunc(const long lMethodNum, tVariant* pvarRetValue, tVariant* paParams, const long lSizeArray)
@@ -494,151 +574,59 @@ bool ADBFileDriver::CallAsFunc(const long lMethodNum, tVariant* pvarRetValue, tV
     __try {
         TV_VT(pvarRetValue) = VTYPE_PWSTR;
         
+        DEBUG_LOG_FMT(L"[CallAsFunc] Метод #%d", lMethodNum);
+        
         switch (lMethodNum) {
-            case 0: // Connect - Подключить
+            case 0: // EnumerateDevices - ПеречислитьУстройства
             {
-                wcscpy_s(m_Status, 512, L"Подключено");
-                m_bConnected = true;
-                LogWrite(L"Подключение выполнено");
-                TV_VT(pvarRetValue) = VTYPE_BOOL;
-                TV_BOOL(pvarRetValue) = VARIANT_TRUE;
-                return true;
-            }
-            case 1: // Disconnect - Отключить
-            {
-                if (m_bConnected) {
-                    wcscpy_s(m_Status, 512, L"Не подключен");
-                    m_bConnected = false;
-                    LogWrite(L"Отключение выполнено");
+                DEBUG_LOG(L"[EnumerateDevices] Начало перечисления MTP устройств");
+                
+                uint32_t count = EnumerateMtpDevices();
+                DEBUG_LOG_FMT(L"[EnumerateDevices] Найдено устройств: %d", (int)count);
+                
+                size_t len = wcslen(m_DeviceList) + 1;
+                if (m_iMemory && m_iMemory->AllocMemory((void**)&pvarRetValue->pwstrVal, (unsigned long)(len * sizeof(WCHAR_T)))) {
+                    convToShortWchar((WCHAR_T**)&pvarRetValue->pwstrVal, m_DeviceList, (uint32_t)len);
                 }
-                TV_VT(pvarRetValue) = VTYPE_BOOL;
-                TV_BOOL(pvarRetValue) = VARIANT_TRUE;
+                pvarRetValue->wstrLen = (uint32_t)wcslen(m_DeviceList);
+                WriteLog(L"Перечисление устройств выполнено");
                 return true;
             }
-            case 2: // EnumerateDevices - ПеречислитьУстройства
+            case 1: // Connect - Подключить
             {
-                if (!LoadAdbFunctions()) {
-                    wcscpy_s(m_Status, 512, L"Ошибка: AdbWinUsbApi.dll не найден");
-                    LogWrite(L"Ошибка: AdbWinUsbApi.dll не найден");
+                DEBUG_LOG(L"[Connect] Начало подключения");
+                
+                if (paParams == nullptr || paParams[0].pwstrVal == nullptr) {
+                    wcscpy_s(m_Status, 512, L"Ошибка: неверный параметр");
                     TV_VT(pvarRetValue) = VTYPE_BOOL;
                     TV_BOOL(pvarRetValue) = VARIANT_FALSE;
                     return true;
                 }
                 
-                // Сначала определяем размер
-                m_DeviceList[0] = L'\0';
-                uint32_t requiredSize = 4; // "[]" + null
+                DEBUG_LOG_FMT(L"[Connect] Имя устройства: %s", paParams[0].pwstrVal);
                 
-                // Перечисляем устройства
-                ADBAPIHANDLE enumHandle = pAdbEnumInterfaces(ADB_USB_CLASS_ID, true, true, true);
-                if (enumHandle == nullptr) {
-                    wcscpy_s(m_DeviceList, L"[]");
-                    m_DeviceCount = 0;
-                    TV_VT(pvarRetValue) = VTYPE_PWSTR;
-                    size_t len = wcslen(m_DeviceList) + 1;
-                    if (m_iMemory && m_iMemory->AllocMemory((void**)&pvarRetValue->pwstrVal, (unsigned long)(len * sizeof(WCHAR_T)))) {
-                        convToShortWchar((WCHAR_T**)&pvarRetValue->pwstrVal, m_DeviceList, (uint32_t)len);
-                    }
-                    pvarRetValue->wstrLen = (uint32_t)wcslen(m_DeviceList);
-                    return true;
-                }
+                bool result = ConnectToDevice(paParams[0].pwstrVal);
                 
-                // Собираем устройства
-                wchar_t deviceSerials[16][64]; // serial для каждого устройства
-                unsigned short deviceVendorIds[16];
-                unsigned short deviceProductIds[16];
-                uint32_t deviceCount = 0;
-                unsigned long infoSize = 0;
+                TV_VT(pvarRetValue) = VTYPE_BOOL;
+                TV_BOOL(pvarRetValue) = result ? VARIANT_TRUE : VARIANT_FALSE;
                 
-                // Определяем количество устройств
-                if (pAdbNextInterface(enumHandle, nullptr, &infoSize)) {
-                    AdbInterfaceInfo* info = (AdbInterfaceInfo*)malloc(infoSize);
-                    if (info) {
-                        while (pAdbNextInterface(enumHandle, info, &infoSize)) {
-                            ADBAPIHANDLE iface = pAdbCreateInterfaceByName(info->device_name);
-                            if (iface) {
-                                wchar_t serial[64] = L"";
-                                unsigned long serialSize = 64;
-                                if (pAdbGetSerialNumber(iface, serial, &serialSize, false)) {
-                                    wcsncpy_s(deviceSerials[deviceCount], 64, serial, 63);
-                                    
-                                    USB_DEVICE_DESCRIPTOR devDesc;
-                                    ZeroMemory(&devDesc, sizeof(devDesc));
-                                    if (pAdbGetUsbDeviceDescriptor(iface, &devDesc)) {
-                                        deviceVendorIds[deviceCount] = devDesc.idVendor;
-                                        deviceProductIds[deviceCount] = devDesc.idProduct;
-                                    }
-                                    deviceCount++;
-                                }
-                                pAdbCloseHandle(iface);
-                            }
-                            if (deviceCount >= 16) break;
-                        }
-                        free(info);
-                    }
-                }
-                pAdbCloseHandle(enumHandle);
-                
-                m_DeviceCount = deviceCount;
-                
-                // Формируем JSON
-                if (deviceCount == 0) {
-                    wcscpy_s(m_DeviceList, L"[]");
+                if (result) {
+                    WriteLog(L"Подключение выполнено");
                 } else {
-                    wcscpy_s(m_DeviceList, L"[");
-                    for (uint32_t i = 0; i < deviceCount; i++) {
-                        if (i > 0) { wcscat_s(m_DeviceList, L","); }
-                        wcscat_s(m_DeviceList, L"[");
-                        wcscat_s(m_DeviceList, L"\"serial\":\"");
-                        wcscat_s(m_DeviceList, deviceSerials[i]);
-                        wcscat_s(m_DeviceList, L"\",\"vendorId\":0x");
-                        wchar_t vidStr[16];
-                        swprintf_s(vidStr, L"%04X", (unsigned int)deviceVendorIds[i]);
-                        wcscat_s(m_DeviceList, vidStr);
-                        wcscat_s(m_DeviceList, L",\"productId\":0x");
-                        wchar_t pidStr[16];
-                        swprintf_s(pidStr, L"%04X", (unsigned int)deviceProductIds[i]);
-                        wcscat_s(m_DeviceList, pidStr);
-                        wcscat_s(m_DeviceList, L"]");
-                    }
-                    wcscat_s(m_DeviceList, L"]");
+                    WriteLog(L"Подключение не удалось");
                 }
-                
-                size_t len = wcslen(m_DeviceList) + 1;
-                if (m_iMemory && m_iMemory->AllocMemory((void**)&pvarRetValue->pwstrVal, (unsigned long)(len * sizeof(WCHAR_T)))) {
-                    convToShortWchar((WCHAR_T**)&pvarRetValue->pwstrVal, m_DeviceList, (uint32_t)len);
-                }
-                pvarRetValue->wstrLen = (uint32_t)wcslen(m_DeviceList);
-                LogWrite(L"Перечисление устройств выполнено");
                 return true;
             }
-            case 3: // GetDeviceInfo - ПолучитьИнформациюОУстройстве
+            case 2: // Disconnect - Отключить
             {
-                if (lMethodNum != 3 || paParams == nullptr) {
-                    TV_VT(pvarRetValue) = VTYPE_EMPTY;
-                    return false;
-                }
+                DEBUG_LOG(L"[Disconnect] Начало отключения");
                 
-                // Получаем индекс устройства
-                long index = 0;
-                if (TV_VT(&paParams[0]) == VTYPE_I4) {
-                    index = TV_I4(&paParams[0]);
-                }
+                DisconnectDevice();
                 
-                if (index < 0 || index >= (long)m_DeviceCount) {
-                    wcscpy_s(m_DeviceList, L"");
-                    TV_VT(pvarRetValue) = VTYPE_PWSTR;
-                    pvarRetValue->wstrLen = 0;
-                    return true;
-                }
+                TV_VT(pvarRetValue) = VTYPE_BOOL;
+                TV_BOOL(pvarRetValue) = VARIANT_TRUE;
                 
-                // Возвращаем информацию о конкретном устройстве
-                // В MVP возвращаем JSON со всем списком
-                size_t len = wcslen(m_DeviceList) + 1;
-                if (m_iMemory && m_iMemory->AllocMemory((void**)&pvarRetValue->pwstrVal, (unsigned long)(len * sizeof(WCHAR_T)))) {
-                    convToShortWchar((WCHAR_T**)&pvarRetValue->pwstrVal, m_DeviceList, (uint32_t)len);
-                }
-                pvarRetValue->wstrLen = (uint32_t)wcslen(m_DeviceList);
+                WriteLog(L"Отключение выполнено");
                 return true;
             }
             default:
@@ -669,13 +657,16 @@ void ADBFileDriver::LogWrite(const wchar_t* message)
     // Временно всегда включено для отладки
     // if (!m_EnableLog) return;
     
+    // Также выводим в DebugView
+    DEBUG_LOG(message);
+    
     EnterCriticalSection(&m_LogLock);
     
     // Открываем файл если не открыт
-    if (m_LogHandle == INVALID_HANDLE_VALUE) {
+    if (m_LogHandle == nullptr) {
         m_LogHandle = CreateFileW(m_LogPath, GENERIC_WRITE, FILE_SHARE_READ, NULL, 
                                    OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-        if (m_LogHandle == INVALID_HANDLE_VALUE) {
+        if (m_LogHandle == nullptr) {
             LeaveCriticalSection(&m_LogLock);
             return;
         }

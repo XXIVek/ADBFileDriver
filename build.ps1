@@ -28,8 +28,9 @@ if ($LASTEXITCODE -ne 0) {
 Write-Host "Project generated."
 
 # Build
-Write-Host "Building (Release)..."
-cmake --build . --config Release
+$config = if ($args -contains "Debug") { "Debug" } else { "Release" }
+Write-Host "Building ($config)..."
+cmake --build . --config $config
 if ($LASTEXITCODE -ne 0) {
     Write-Host "ERROR: Build failed."
     exit 1
@@ -46,6 +47,8 @@ Write-Host ""
 Write-Host "=== Build Success! ==="
 Write-Host "DLL:  1C/Release/Win64/ADBFileDriver_Win64.dll"
 Write-Host "Manifest: 1C/Release/Win64/bundle/MANIFEST.xml"
+Write-Host ""
+Write-Host "Usage: .\build.ps1 [Debug|Release]"
 Write-Host ""
 Write-Host "Usage in 1C:"
 Write-Host "  Driver = New('AddIn.ADBFileDriver.ADBFileDriver')"
