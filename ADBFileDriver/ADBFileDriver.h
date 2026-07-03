@@ -28,6 +28,20 @@ static const CLSID CLSID_PortableDeviceManager =
 static const IID IID_IPortableDeviceManager = 
 { 0x3D2CDE48, 0x5B, 0x4D, { 0x9D, 0x35, 0xF7, 0xE4, 0x9B, 0xB1, 0x3B, 0xD2 } };
 
+// Объявление интерфейса IPortableDeviceManager (так как заголовок недоступен)
+struct IPortableDeviceManager : public IUnknown
+{
+    virtual HRESULT STDMETHODCALLTYPE GetDevices(
+        _Out_writes_(c32Devices) LPWSTR *ppwstrDeviceIds,
+        _In_ DWORD c32Devices,
+        _Out_ DWORD *pc32DevicesReturned) = 0;
+    
+    virtual HRESULT STDMETHODCALLTYPE GetDeviceType(
+        _In_ LPCWSTR pwszDeviceId,
+        _Out_writes_(c32Type) LPWSTR pwszType,
+        _Inout_ DWORD *pc32Type) = 0;
+};
+
 ///////////////////////////////////////////////////////////////////////////////
 // class ADBFileDriver (MTP Device Manager)
 class ADBFileDriver : public IComponentBase
