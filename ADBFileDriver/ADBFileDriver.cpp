@@ -385,7 +385,7 @@ long ADBFileDriver::GetNParams(const long lMethodNum)
 {
     switch (lMethodNum) {
     case 0: return 0; case 1: return 1; case 2: return 0; case 3: return 1;
-    case 4: return 2; case 5: return 2; case 6: return 1; case 7: return 1; case 8: return 1;
+    case 4: return 1; case 5: return 2; case 6: return 1; case 7: return 1; case 8: return 1;
     default: return 0;
     }
 }
@@ -1341,6 +1341,37 @@ bool ADBFileDriver::DownloadFile(const wchar_t* fileName, wchar_t** content, uin
         *content = new (std::nothrow) wchar_t[*contentSize];
         if (*content) {
             wcscpy_s(*content, *contentSize, wBuffer);
+            
+            // Логирование для отладки терминального нуля
+            wchar_t debugInfo[512];
+            swprintf_s(debugInfo, 512, L"[DOWNLOAD] fileName='%s', contentSize=%d, wLen=%d, bytesRead=%d, fileSize=%d", 
+                      fileName, *contentSize, wLen, (int)bytesRead, (int)fileSize);
+            DebugLogW(debugInfo);
+            
+            // Показываем последние 10 байт исходного файла
+            if (bytesRead >= 10) {
+                char lastBytes[11] = {0};
+                memcpy(lastBytes, buffer + bytesRead - 10, 10);
+                swprintf_s(debugInfo, 512, L"[DOWNLOAD] last 10 bytes: ");
+                for (int i = 0; i < 10; i++) {
+                    wchar_t byteStr[8];
+                    swprintf_s(byteStr, 8, L"%02x ", (unsigned char)lastBytes[i]);
+                    wcscat_s(debugInfo, 512, byteStr);
+                }
+                DebugLogW(debugInfo);
+            }
+            
+            // Показываем последние 5 символов UTF-16
+            wchar_t lastChars[10] = {0};
+            int lastLen = (wLen >= 5) ? 5 : wLen;
+            memcpy(lastChars, wBuffer + wLen - lastLen, lastLen * sizeof(wchar_t));
+            swprintf_s(debugInfo, 512, L"[DOWNLOAD] last %d wchar_t: ", lastLen);
+            for (int i = 0; i < lastLen; i++) {
+                wchar_t charStr[16];
+                swprintf_s(charStr, 16, L"[%d]=%04x ", i, (unsigned short)lastChars[i]);
+                wcscat_s(debugInfo, 512, charStr);
+            }
+            DebugLogW(debugInfo);
         }
     }
     
@@ -1536,9 +1567,27 @@ bool ADBFileDriver::CallAsFunc(const long lMethodNum, tVariant* pvarRetValue, tV
                 pvarRetValue->wstrLen = 0;
                 
                 if (success && fileContent != nullptr) {
-                    if (m_iMemory && m_iMemory->AllocMemory((void**)&pvarRetValue->pwstrVal, (unsigned long)(contentSize * sizeof(WCHAR_T)))) {
-                        memcpy(pvarRetValue->pwstrVal, fileContent, contentSize * sizeof(WCHAR_T));
-                        pvarRetValue->wstrLen = contentSize - 1; // без терминального нуля
+                    // contentSize включает терминальный ноль, вычитаем его
+                    uint32_t dataLen = contentSize - 1;
+                    
+                    // Удаляем trailing символы (adb pull добавляет \r\n в конец)
+                    while (dataLen > 0 && (fileContent[dataLen - 1] == L'\r' || fileContent[dataLen - 1] == L'\n' || fileContent[dataLen - 1] == L'\0')) {
+                        dataLen--;
+                    }
+                    
+                    if (dataLen == 0) {
+                        // Пустой файл
+                        if (m_iMemory && m_iMemory->AllocMemory((void**)&pvarRetValue->pwstrVal, 2)) {
+                            pvarRetValue->pwstrVal[0] = L'\0';
+                            pvarRetValue->wstrLen = 0;
+                        }
+                    } else if (m_iMemory && m_iMemory->AllocMemory((void**)&pvarRetValue->pwstrVal, (unsigned long)((dataLen + 1) * sizeof(WCHAR_T)))) {
+                        // Копируем только нужное количество символов
+                        for (uint32_t i = 0; i < dataLen; i++) {
+                            pvarRetValue->pwstrVal[i] = fileContent[i];
+                        }
+                        pvarRetValue->pwstrVal[dataLen] = L'\0';
+                        pvarRetValue->wstrLen = dataLen;
                     }
                     delete[] fileContent;
                 }
@@ -1552,6 +1601,14 @@ bool ADBFileDriver::CallAsFunc(const long lMethodNum, tVariant* pvarRetValue, tV
                 }
                 
                 TV_VT(pvarRetValue) = VTYPE_PWSTR;
+                
+                // Лог результата
+                if (pvarRetValue->pwstrVal) {
+                    wchar_t retLog[1024];
+                    swprintf_s(retLog, L"[DOWNLOAD] RETURN: vt=0x%04X, wstrLen=%d, content='%s'",
+                               pvarRetValue->vt, pvarRetValue->wstrLen, pvarRetValue->pwstrVal);
+                    DebugLogW(retLog);
+                }
                 return true;
             }
             case 5: {
