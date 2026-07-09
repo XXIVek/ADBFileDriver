@@ -1,6 +1,5 @@
 // ADBFileDriver.cpp : Реализация компоненты для 1С:Предприятие 8.3
 // Android Device Manager - работа с USB устройствами через ADB
-// Отладка через OutputDebugStringW для DebugView
 
 #include "stdafx.h"
 #include "ADBFileDriver.h"
@@ -17,10 +16,6 @@
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "shlwapi.lib")
 
-// Макрос для отладочного вывода через DebugView
-#define DEBUG_LOG(msg) do { OutputDebugStringW(msg); OutputDebugStringW(L"\n"); } while(0)
-#define DEBUG_LOG_FMT(fmt, ...) do { wchar_t _dbgbuf[512]; swprintf_s(_dbgbuf, fmt, __VA_ARGS__); OutputDebugStringW(_dbgbuf); OutputDebugStringW(L"\n"); } while(0)
-
 // SPDRP_PNPDEVICEID
 #ifndef SPDRP_PNPDEVICEID
 #define SPDRP_PNPDEVICEID 0x00000018
@@ -34,31 +29,34 @@ static const wchar_t* g_PropNamesRU[] = { L"Версия", L"ВключитьЛ�
 // Глобальные массивы имен методов
 static const wchar_t* g_MethodNamesEN[] = { 
     L"EnumerateDevices", L"Connect", L"Disconnect", L"ListFiles", 
-    L"DownloadFile", L"UploadFile", L"DeleteFile", L"ListNames",
-    L"ListFilesRecursive" 
+    L"DownloadFile", L"UploadFile", L"DeleteFile", L"ListNames"
 };
 static const wchar_t* g_MethodNamesRU[] = { 
     L"ПеречислитьУстройства", L"Подключить", L"Отключить", L"СписокФайлов", 
-    L"СкачатьФайл", L"ЗагрузитьФайл", L"УдалитьФайл", L"СписокИменФайлов",
-    L"СписокФайловРекурсивно"
+    L"СкачатьФайл", L"ЗагрузитьФайл", L"УдалитьФайл", L"СписокИменФайлов"
 };
-#define METHODS_COUNT 9
+#define METHODS_COUNT 8
 
 // ===== Глобальные переменные =====
 static wchar_t g_adbPath[512] = L"";
-static wchar_t g_DllDirectory[1024] = L""; // Каталог DLL (для FindAdbExe)
 static wchar_t g_LogPathGlobal[512] = L"";
 static bool g_LogEnabled = false;
 
 // ===== Forward declarations =====
-static bool FindAdbExe();
+static bool FindAdbExe(const wchar_t* adbDirectory);
 static bool AdbExec(const wchar_t* args, wchar_t* output, DWORD outputSize);
-static void DebugLogW(const wchar_t* msg);
-static void DebugLogFmtW(const wchar_t* fmt, ...);
 static bool AdbShellList(const wchar_t* serial, const wchar_t* remotePath, wchar_t* fileList, DWORD fileListSize);
 
+// ===== WriteLog - запись в лог-файл =====
 static void WriteLog(const wchar_t* msg)
 {
+    if (msg == nullptr) return;
+    
+    OutputDebugStringW(msg);
+    OutputDebugStringW(L"\r\n");
+    
+    // Логирование в файл если включено и путь задан
+    // g_LogEnabled — глобальная переменная, синхронизируется с m_EnableLog через SetPropVal
     if (!g_LogEnabled || g_LogPathGlobal[0] == L'\0') return;
     
     wchar_t logPath[512];
@@ -82,15 +80,20 @@ static void WriteLog(const wchar_t* msg)
     wchar_t timeBuf[32];
     swprintf_s(timeBuf, L"[%02d:%02d:%02d.%03d] ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
     
+    char timeStr[32];
+    WideCharToMultiByte(CP_ACP, 0, timeBuf, -1, timeStr, 32, NULL, NULL);
+    
     int utf8Len = WideCharToMultiByte(CP_UTF8, 0, msg, -1, NULL, 0, NULL, NULL);
     if (utf8Len <= 0) { CloseHandle(hLog); return; }
     
-    char* utf8Str = new char[utf8Len + 64];
-    WideCharToMultiByte(CP_UTF8, 0, msg, -1, utf8Str, utf8Len, NULL, NULL);
+    char* utf8Str = new char[utf8Len + 1];
+    WideCharToMultiByte(CP_UTF8, 0, msg, -1, utf8Str, utf8Len + 1, NULL, NULL);
     
-    char finalEntry[1024];
-    int timeLen = WideCharToMultiByte(CP_ACP, 0, timeBuf, -1, finalEntry, 32, NULL, NULL);
-    sprintf_s(finalEntry + timeLen, 1024 - timeLen, "%s\r\n", utf8Str);
+    char finalEntry[2048];
+    strcpy_s(finalEntry, 2048, timeStr);
+    strcat_s(finalEntry, 2048, " ");
+    strcat_s(finalEntry, 2048, utf8Str);
+    strcat_s(finalEntry, 2048, "\r\n");
     
     DWORD bytesWritten;
     WriteFile(hLog, finalEntry, (DWORD)strlen(finalEntry), &bytesWritten, NULL);
@@ -119,9 +122,8 @@ ADBFileDriver::ADBFileDriver(void)
     m_CurrentPath[0] = L'\0';
     m_DeviceCount = 0;
     m_FileCount = 0;
-    
-    // m_AdbDirectory инициализируется пользователем через свойство КаталогADB
     m_AdbDirectory[0] = L'\0';
+    m_LastDeviceSerial[0] = L'\0';
 }
 
 ADBFileDriver::~ADBFileDriver()
@@ -141,10 +143,7 @@ bool ADBFileDriver::Init(void* Interface)
     if (Interface == nullptr) return false;
     m_iConnect = static_cast<IAddInDefBase*>(Interface);
     m_bInitialized = true;
-    
-    wchar_t msg[512];
-    swprintf_s(msg, L"Компонента инициализирована, лог: %s", m_LogPath);
-    WriteLog(msg);
+    { wchar_t msg[256]; swprintf_s(msg, L"[INIT] Компонента создана, Initialized=true"); WriteLog(msg); }
     return true;
 }
 
@@ -163,8 +162,6 @@ void ADBFileDriver::Done()
     if (m_iConnect) { m_iConnect = nullptr; }
     if (m_iMemory) { m_iMemory = nullptr; }
     m_bInitialized = false;
-    
-    DebugLogW(L"[DONE] ADBFileDriver Done()");
 }
 
 // ===== ILanguageExtenderBase - Свойства =====
@@ -198,12 +195,11 @@ const WCHAR_T* ADBFileDriver::GetPropName(long lPropNum, long lPropAlias)
 
 bool ADBFileDriver::GetPropVal(const long lPropNum, tVariant* pvarPropVal)
 {
-    // Инициализируем возвращаемое значение
     tVarInit(pvarPropVal);
     
-    __try {
+    try {
         switch (lPropNum) {
-            case 0: {
+            case 0: { // Version
                 const wchar_t* versionStr = L"2.10.0.0";
                 pvarPropVal->pwstrVal = nullptr;
                 pvarPropVal->wstrLen = 0;
@@ -261,7 +257,7 @@ bool ADBFileDriver::GetPropVal(const long lPropNum, tVariant* pvarPropVal)
                 TV_VT(pvarPropVal) = VTYPE_PWSTR;
                 return true;
             }
-            case 7: { // epAdbDirectory
+            case 7: { // AdbDirectory
                 pvarPropVal->pwstrVal = nullptr;
                 pvarPropVal->wstrLen = 0;
                 size_t vlen = wcslen(m_AdbDirectory) + 1;
@@ -276,7 +272,7 @@ bool ADBFileDriver::GetPropVal(const long lPropNum, tVariant* pvarPropVal)
                 TV_VT(pvarPropVal) = VTYPE_EMPTY;
                 return false;
         }
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
+    } catch (...) {
         if (m_iConnect) {
             EXCEPINFO info; ZeroMemory(&info, sizeof(EXCEPINFO));
             info.wCode = ADDIN_E_FAIL; info.bstrSource = SysAllocString(L"ADBFileDriver");
@@ -291,20 +287,18 @@ bool ADBFileDriver::GetPropVal(const long lPropNum, tVariant* pvarPropVal)
 
 bool ADBFileDriver::SetPropVal(const long lPropNum, tVariant* varPropVal)
 {
-    __try {
+    try {
         switch (lPropNum) {
-            case 1: {
+            case 1: { // EnableLog
                 long boolVal = 0;
                 if (TV_VT(varPropVal) == VTYPE_BOOL) boolVal = (TV_BOOL(varPropVal) != 0) ? 1 : 0;
                 else if (TV_VT(varPropVal) == VTYPE_I4) boolVal = (TV_I4(varPropVal) != 0) ? 1 : 0;
-                if (m_EnableLog != (boolVal != 0)) {
-                    m_EnableLog = (boolVal != 0);
-                    wcscpy_s(g_LogPathGlobal, 512, m_LogPath);
-                    g_LogEnabled = m_EnableLog;
-                }
+                m_EnableLog = (boolVal != 0);
+                wcscpy_s(g_LogPathGlobal, 512, m_LogPath);
+                g_LogEnabled = m_EnableLog;
                 return true;
             }
-            case 2:
+            case 2: { // LogPath
                 if (TV_VT(varPropVal) == VTYPE_PWSTR && varPropVal->pwstrVal != nullptr) {
                     size_t len = wcslen(varPropVal->pwstrVal);
                     if (len > 0 && len < 511) {
@@ -314,43 +308,26 @@ bool ADBFileDriver::SetPropVal(const long lPropNum, tVariant* varPropVal)
                     }
                 }
                 return true;
-            case 7: // epAdbDirectory
-                // КаталоADB содержит полный путь к adb.exe
-                // Просто копируем и добавляем \ в конце если нет
+            }
+            case 7: { // AdbDirectory
                 if (TV_VT(varPropVal) == VTYPE_PWSTR && varPropVal->pwstrVal != nullptr) {
                     size_t len = wcslen(varPropVal->pwstrVal);
-                    if (len > 0 && len < 1024) {
-                        // Копируем путь как есть
-                        wcscpy_s(m_AdbDirectory, 1024, varPropVal->pwstrVal);
-                        
-                        // Добавляем обратный слэш если его нет
-                        if (wcslen(m_AdbDirectory) > 0 && m_AdbDirectory[wcslen(m_AdbDirectory) - 1] != L'\\')
-                            wcscat_s(m_AdbDirectory, 1024, L"\\");
-                        
-                        // Также обновляем g_DllDirectory для совместимости с FindAdbExe
-                        wcscpy_s(g_DllDirectory, 1024, varPropVal->pwstrVal);
-                        if (wcslen(g_DllDirectory) > 0 && g_DllDirectory[wcslen(g_DllDirectory) - 1] != L'\\')
-                            wcscat_s(g_DllDirectory, 1024, L"\\");
+                    if (len > 0 && len < 511) {
+                        wcscpy_s(m_AdbDirectory, 512, varPropVal->pwstrVal);
                     }
                 }
                 return true;
+            }
             default:
                 return false;
         }
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        if (m_iConnect) {
-            EXCEPINFO info; ZeroMemory(&info, sizeof(EXCEPINFO));
-            info.wCode = ADDIN_E_FAIL; info.bstrSource = SysAllocString(L"ADBFileDriver");
-            info.bstrDescription = SysAllocString(L"Error"); info.scode = E_FAIL;
-            m_iConnect->AddError(info.wCode, info.bstrSource, info.bstrDescription, info.scode);
-            SysFreeString(info.bstrSource); SysFreeString(info.bstrDescription);
-        }
+    } catch (...) {
         return false;
     }
 }
 
 bool ADBFileDriver::IsPropReadable(const long lPropNum) { return lPropNum >= 0 && lPropNum < PROPS_COUNT; }
-bool ADBFileDriver::IsPropWritable(const long lPropNum) { return lPropNum == 1 || lPropNum == 2 || lPropNum == 7; } // 7 = epAdbDirectory
+bool ADBFileDriver::IsPropWritable(const long lPropNum) { return lPropNum == 1 || lPropNum == 2 || lPropNum == 7; }
 
 // ===== ILanguageExtenderBase - Методы =====
 
@@ -385,7 +362,7 @@ long ADBFileDriver::GetNParams(const long lMethodNum)
 {
     switch (lMethodNum) {
     case 0: return 0; case 1: return 1; case 2: return 0; case 3: return 1;
-    case 4: return 1; case 5: return 2; case 6: return 1; case 7: return 1; case 8: return 1;
+    case 4: return 1; case 5: return 2; case 6: return 1; case 7: return 1;
     default: return 0;
     }
 }
@@ -426,111 +403,66 @@ static bool IsAndroidVendorId(const wchar_t* pnpId)
 
 // ===== ADB helper functions =====
 
-static bool FindAdbExe()
+static bool FindAdbExe(const wchar_t* adbDirectory)
 {
-    wchar_t dbgMsg[512];
+    if (g_adbPath[0] != L'\0') return true;
     
-    OutputDebugStringW(L"[FINDADB] ENTER");
-    if (g_adbPath[0] != L'\0') { OutputDebugStringW(L"[FINDADB] Already set, returning true"); return true; }
-    
-    // STEP 1: Поиск относительно каталога DLL (из g_DllDirectory)
-    OutputDebugStringW(L"[FINDADB] STEP 1: Check g_DllDirectory");
-    
-    wchar_t dllPath[1024] = L"";
-    if (g_DllDirectory[0] != L'\0') {
-        wcscpy_s(dllPath, 1024, g_DllDirectory);
-    } else {
-        OutputDebugStringW(L"[FINDADB]   g_DllDirectory is empty");
-    }
-    
-    if (dllPath[0] != L'\0') {
-        swprintf_s(dbgMsg, L"[FINDADB] ADB dir: %s", dllPath);
-        OutputDebugStringW(dbgMsg);
+    if (adbDirectory != nullptr && adbDirectory[0] != L'\0') {
+        wchar_t adbPath[1024];
+        wcscpy_s(adbPath, 1024, adbDirectory);
+        size_t dirLen = wcslen(adbPath);
+        if (dirLen > 0 && adbPath[dirLen - 1] != L'\\' && adbPath[dirLen - 1] != L'/') {
+            wcscat_s(adbPath, 1024, L"\\");
+        }
+        wcscat_s(adbPath, 1024, L"adb.exe");
         
-        // Проверяем adb.exe непосредственно в каталоге
-        wchar_t adbPathFull[1024];
-        swprintf_s(adbPathFull, 1024, L"%sadb.exe", dllPath);
-        swprintf_s(dbgMsg, L"[FINDADB]   Check: %s", adbPathFull);
-        OutputDebugStringW(dbgMsg);
-        if (PathFileExistsW(adbPathFull)) {
-            wcscpy_s(g_adbPath, 512, adbPathFull);
-            swprintf_s(dbgMsg, L"[FINDADB] FOUND: %s", adbPathFull);
-            OutputDebugStringW(dbgMsg);
+        if (PathFileExistsW(adbPath)) {
+            wcscpy_s(g_adbPath, 512, adbPath);
             return true;
-        } else {
-            swprintf_s(dbgMsg, L"[FINDADB]   Result: NOT FOUND");
-            OutputDebugStringW(dbgMsg);
         }
     }
     
-    OutputDebugStringW(L"[FINDADB] STEP 2: Check PATH env");
     wchar_t pathEnv[1024];
     DWORD ret = GetEnvironmentVariableW(L"PATH", pathEnv, 1024);
-    swprintf_s(dbgMsg, L"[FINDADB] GetEnvironmentVariableW returned: %d", ret);
-    OutputDebugStringW(dbgMsg);
-    
     if (ret > 0 && ret < 1024) {
         wchar_t* copy = new (std::nothrow) wchar_t[1024];
         if (copy) {
             wcscpy_s(copy, 1024, pathEnv);
             wchar_t* tok = wcstok_s(copy, L";;", nullptr);
-            int tokCount = 0;
             while (tok) {
-                swprintf_s(dbgMsg, L"[FINDADB]   PATH[%d]: %s", tokCount, tok);
-                OutputDebugStringW(dbgMsg);
                 wchar_t full[1024]; swprintf_s(full, 1024, L"%s\\\\adb.exe", tok);
                 if (PathFileExistsW(full)) {
                     wcscpy_s(g_adbPath, 512, full);
-                    swprintf_s(dbgMsg, L"[FINDADB] FOUND in PATH: %s", full);
-                    OutputDebugStringW(dbgMsg);
                     delete[] copy;
                     return true;
                 }
                 tok = wcstok_s(nullptr, L";;", nullptr);
-                tokCount++;
             }
             delete[] copy;
         }
     }
     
-    OutputDebugStringW(L"[FINDADB] NOT FOUND, returning false");
     return false;
 }
 
-// ===== ADB Execute без таймаута =====
-// ADB сам запускает сервер при первой команде если он не запущен
 static bool AdbExec(const wchar_t* args, wchar_t* output, DWORD outputSize)
 {
-    if (!FindAdbExe()) {
-        DebugLogW(L"[ADB] AdbExec: FindAdbExe failed");
-        return false;
-    }
+    if (!FindAdbExe(g_adbPath)) return false;
     
-    // Создаём pipe для перехвата stdout
     HANDLE hRead, hWrite;
     SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
-    if (!CreatePipe(&hRead, &hWrite, &sa, 0)) {
-        DebugLogW(L"[ADB] CreatePipe hRead/hWrite failed");
-        return false;
-    }
+    if (!CreatePipe(&hRead, &hWrite, &sa, 0)) return false;
     
-    // Создаём pipe для перехвата stderr
     HANDLE hErrRead, hErrWrite;
     if (!CreatePipe(&hErrRead, &hErrWrite, &sa, 0)) {
-        CloseHandle(hRead); CloseHandle(hWrite); 
-        DebugLogW(L"[ADB] CreatePipe hErrRead/hErrWrite failed");
-        return false;
+        CloseHandle(hRead); CloseHandle(hWrite); return false;
     }
     
-    // Создаём null-device для stdin (чтобы adb не ждал ввода)
     HANDLE hStdInput = CreateFileA("NUL", GENERIC_READ, FILE_SHARE_READ, &sa, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hStdInput == INVALID_HANDLE_VALUE || hStdInput == NULL) {
-        CloseHandle(hRead); CloseHandle(hWrite); CloseHandle(hErrRead); CloseHandle(hErrWrite); 
-        DebugLogW(L"[ADB] CreateFile NUL failed");
-        return false;
+        CloseHandle(hRead); CloseHandle(hWrite); CloseHandle(hErrRead); CloseHandle(hErrWrite); return false;
     }
     
-    // ADB возвращает ANSI/UTF-8 вывод, используем ANSI API
     STARTUPINFOA si = { sizeof(si) };
     PROCESS_INFORMATION pi = {0};
     si.dwFlags |= STARTF_USESTDHANDLES;
@@ -538,141 +470,64 @@ static bool AdbExec(const wchar_t* args, wchar_t* output, DWORD outputSize)
     si.hStdError = hErrWrite;
     si.hStdInput = hStdInput;
     
-    // Формируем полную команду: "C:\path\to\adb.exe" args
     char adbPathA[1024];
     int pathLen = WideCharToMultiByte(CP_ACP, 0, g_adbPath, -1, adbPathA, sizeof(adbPathA), nullptr, nullptr);
-    if (pathLen <= 0) {
-        CloseHandle(hRead); CloseHandle(hWrite); CloseHandle(hErrRead); CloseHandle(hErrWrite);
-        CloseHandle(hStdInput);
-        DebugLogW(L"[ADB] WideCharToMultiByte adbPath failed");
-        return false;
-    }
+    if (pathLen <= 0) { CloseHandle(hRead); CloseHandle(hWrite); CloseHandle(hErrRead); CloseHandle(hErrWrite); CloseHandle(hStdInput); return false; }
     
-    // Конвертируем args из wchar_t в char
     char argsA[2048];
     int argsLen = WideCharToMultiByte(CP_ACP, 0, args, -1, argsA, sizeof(argsA), nullptr, nullptr);
-    if (argsLen <= 0) {
-        CloseHandle(hRead); CloseHandle(hWrite); CloseHandle(hErrRead); CloseHandle(hErrWrite);
-        CloseHandle(hStdInput);
-        DebugLogW(L"[ADB] WideCharToMultiByte args failed");
-        return false;
-    }
+    if (argsLen <= 0) { CloseHandle(hRead); CloseHandle(hWrite); CloseHandle(hErrRead); CloseHandle(hErrWrite); CloseHandle(hStdInput); return false; }
     
     char cmdA[4096];
-    // Добавляем кавычки вокруг пути если есть пробелы
     if (strchr(adbPathA, ' ') != nullptr) {
         sprintf_s(cmdA, sizeof(cmdA), "\"%s\" %s", adbPathA, argsA);
     } else {
         sprintf_s(cmdA, sizeof(cmdA), "%s %s", adbPathA, argsA);
     }
     
-    DebugLogFmtW(L"[ADB] CMD: %S", cmdA);
-    
     if (!CreateProcessA(NULL, cmdA, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
-        DWORD err = GetLastError();
-        char errBuf[128]; sprintf_s(errBuf, 128, "[ADB] CreateProcessA failed: err=%d\r\n", (int)err);
-        OutputDebugStringA(errBuf);
-        DebugLogFmtW(L"[ADB] CreateProcessA failed: err=%d", (int)err);
-        CloseHandle(si.hStdInput);
-        CloseHandle(hRead); CloseHandle(hWrite); CloseHandle(hErrRead); CloseHandle(hErrWrite); 
-        return false;
+        CloseHandle(si.hStdInput); CloseHandle(hRead); CloseHandle(hWrite); CloseHandle(hErrRead); CloseHandle(hErrWrite); return false;
     }
-    DebugLogW(L"[ADB] CreateProcessA success");
     
-    // Закрываем hWrite ДО ожидания — иначе ADB может буферизировать вывод в pipe
     CloseHandle(hWrite);
-    DebugLogW(L"[ADB] hWrite closed, waiting for process...");
-    
-    // Ждём завершения без таймаута — ADB сам завершится когда будет готов
     DWORD waitResult = WaitForSingleObject(pi.hProcess, INFINITE);
-    DebugLogW(L"[ADB] WaitForSingleObject completed");
     
     if (waitResult == WAIT_TIMEOUT) {
-        DebugLogW(L"[ADB] UNEXPECTED: process did not complete with INFINITE timeout");
         TerminateProcess(pi.hProcess, 1);
         CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
         CloseHandle(hRead); CloseHandle(hErrRead);
         return false;
     }
     
-    // Получаем код завершения процесса
-    DWORD exitCode = 0;
-    GetExitCodeProcess(pi.hProcess, &exitCode);
-    DebugLogFmtW(L"[ADB] Process exit code: %d", (int)exitCode);
-    
     CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
     
-    // Читаем stdout — используем PeekNamedPipe для проверки данных
-    DebugLogW(L"[ADB] Reading stdout...");
     DWORD bytesRead = 0; char rawBuf[65536] = ""; char* ptr = rawBuf;
     DWORD totalRead = 0;
     while (totalRead < (DWORD)(sizeof(rawBuf) - 1)) {
         DWORD peekBytes = 0;
         if (!PeekNamedPipe(hRead, NULL, 0, NULL, &peekBytes, NULL)) break;
         if (peekBytes == 0) break;
-        
         DWORD toRead = (peekBytes < 4096) ? peekBytes : 4096;
         if (!ReadFile(hRead, ptr, toRead, &bytesRead, NULL) || bytesRead == 0) break;
-        ptr += bytesRead;
-        totalRead += bytesRead;
+        ptr += bytesRead; totalRead += bytesRead;
     }
-    DebugLogFmtW(L"[ADB] stdout bytesRead: %d", (int)totalRead);
+    CloseHandle(hRead);
     
-    // Закрываем hRead перед чтением stderr
-    CloseHandle(hRead); hRead = NULL;
-    
-    // Читаем stderr (ошибки/вывод ADB)
-    DebugLogW(L"[ADB] Reading stderr...");
-    DWORD errBytesRead = 0; char errBuf[4096] = ""; char* errPtr = errBuf;
+    DWORD errBytesRead = 0; char errBuf[4096] = "";
     DWORD totalErrRead = 0;
-    while (totalErrRead < (DWORD)(sizeof(errBuf) - 1)) {
-        DWORD peekErrBytes = 0;
-        if (!PeekNamedPipe(hErrRead, NULL, 0, NULL, &peekErrBytes, NULL)) break;
-        if (peekErrBytes == 0) break;
-        
-        DWORD toReadErr = (peekErrBytes < 4096) ? peekErrBytes : 4096;
-        if (!ReadFile(hErrRead, errPtr, toReadErr, &errBytesRead, NULL) || errBytesRead == 0) break;
-        errPtr += errBytesRead;
-        totalErrRead += errBytesRead;
-    }
-    DebugLogFmtW(L"[ADB] stderr bytesRead: %d", (int)totalErrRead);
-    
     CloseHandle(hErrRead);
     
-    // Логирование stderr если есть
-    if (totalErrRead > 0) {
-        char errOut[4096]; DWORD errLen = (DWORD)strlen(errBuf);
-        if (errLen > 4095) errLen = 4095;
-        memcpy(errOut, errBuf, errLen);
-        errOut[errLen] = '\0';
-        DebugLogFmtW(L"[ADB] STDERR: %s", errOut);
-    }
-    
-    // Конвертируем UTF-8 в UTF-16 для вывода (ADB возвращает UTF-8)
     if (output && outputSize > 0 && totalRead > 0) {
-        // Сначала логируем сырые байты для отладки
-        char debugBuf[1024];
-        DWORD debugLen = (totalRead > 1023) ? 1023 : (DWORD)totalRead;
-        memcpy(debugBuf, rawBuf, debugLen);
-        debugBuf[debugLen] = '\0';
-        DebugLogFmtW(L"[ADB] stdout RAW (%d байт): %s", (int)totalRead, debugBuf);
-        
         int wLen = MultiByteToWideChar(CP_UTF8, 0, rawBuf, (int)totalRead, nullptr, 0);
-        DebugLogFmtW(L"[ADB] UTF-8 convert wLen=%d", wLen);
-        
         if (wLen > 0) {
             wchar_t* wBuf = new wchar_t[wLen + 1];
-            int result = MultiByteToWideChar(CP_UTF8, 0, rawBuf, (int)totalRead, wBuf, wLen);
-            DebugLogFmtW(L"[ADB] MultiByteToWideChar result=%d", result);
+            MultiByteToWideChar(CP_UTF8, 0, rawBuf, (int)totalRead, wBuf, wLen);
             wBuf[wLen] = L'\0';
-            
-            // Убираем \r\n
             DWORD maxC = outputSize / sizeof(wchar_t) - 1;
             DWORD outLen = (DWORD)wcslen(wBuf);
             if (outLen > maxC) outLen = maxC;
             wcsncpy_s(output, outputSize, wBuf, outLen);
             output[outLen] = L'\0';
-            DebugLogFmtW(L"[ADB] final output (%d символов): %s", (int)outLen, output);
             delete[] wBuf;
         } else {
             output[0] = L'\0';
@@ -687,486 +542,358 @@ static bool AdbShellList(const wchar_t* serial, const wchar_t* remotePath, wchar
 {
     wchar_t cmd[1024];
     
-    // Определяем путь для команды ls
-    // Используем "ls -l" для получения детальной информации о файлах
-    // Формат вывода ls -l: drwxrwx--- 2 root everybody 3488 2022-08-12 10:12 Browser
-    // Первый символ: 'd' = директория, '-' = файл
     if (remotePath == nullptr || remotePath[0] == L'\0') {
-        // Корень устройства — ls -l без аргумента
-        if (serial && serial[0] != L'\0') {
-            swprintf_s(cmd, 1024, L"-s %s shell ls -l", serial);
-        } else {
-            swprintf_s(cmd, 1024, L"shell ls -l");
-        }
+        if (serial && serial[0] != L'\0') swprintf_s(cmd, 1024, L"-s %s shell ls -l %s", serial, remotePath ? remotePath : L"/");
+        else swprintf_s(cmd, 1024, L"shell ls -l /");
     } else {
-        // remotePath должен быть абсолютным путём (начинаться с /)
         if (remotePath[0] == L'/') {
-            if (serial && serial[0] != L'\0') {
-                swprintf_s(cmd, 1024, L"-s %s shell ls -l \"%s\"", serial, remotePath);
-            } else {
-                swprintf_s(cmd, 1024, L"shell ls -l \"%s\"", remotePath);
-            }
+            if (serial && serial[0] != L'\0') swprintf_s(cmd, 1024, L"-s %s shell ls -l %s", serial, remotePath);
+            else swprintf_s(cmd, 1024, L"shell ls -l %s", remotePath);
         } else {
-            // Если путь не абсолютный — возвращаем ошибку
-            DebugLogFmtW(L"[SHELL] ERROR: путь должен быть абсолютным: %s", remotePath);
             return false;
         }
     }
     
-    DebugLogFmtW(L"[SHELL] CMD: %s", cmd);
-    
     wchar_t output[65536] = L"";
-    if (!AdbExec(cmd, output, sizeof(output))) {
-        DebugLogW(L"[SHELL] AdbExec вернул false");
-        return false;
-    }
-    
-    // Логирование вывода для отладки
-    if (wcslen(output) > 0) {
-        DebugLogFmtW(L"[SHELL] ls output (%d символов):\n%s", (int)wcslen(output), output);
-    } else {
-        DebugLogW(L"[SHELL] ls output: пусто");
-    }
+    if (!AdbExec(cmd, output, sizeof(output))) return false;
     
     fileList[0] = L'\0'; DWORD fc = 0;
-    wchar_t* copy = new wchar_t[wcslen(output) + 1]; wcscpy_s(copy, wcslen(output) + 1, output);
-    wchar_t* lineStart = copy; wchar_t* lineEnd;
     
-    // Сначала заменяем все \n на \r\n для единообразного разбора
-    wchar_t* normalized = new wchar_t[wcslen(output) + 1];
+    wchar_t* normalized = new wchar_t[wcslen(output) * 2 + 1];
     wchar_t* dst = normalized;
     const wchar_t* src = output;
     while (*src != L'\0') {
-        if (*src == L'\n' && (src == output || *(src - 1)) != L'\r') {
-            *dst++ = L'\r';
+        if (*src == L'\n') {
+            if (src == output || (*(src - 1)) != L'\r') { *dst++ = L'\r'; }
             *dst++ = L'\n';
-        } else if (*src != L'\r') {  // пропускаем старые \r
-            *dst++ = *src;
         }
+        else if (*src != L'\r') { *dst++ = *src; }
         src++;
     }
     *dst = L'\0';
     
-    lineStart = normalized;
-    while ((lineEnd = wcsstr(lineStart, L"\r\n")) != nullptr) {
+    wchar_t* lineStart = normalized;
+    wchar_t* lineEnd;
+    while ((lineEnd = wcschr(lineStart, L'\n')) != nullptr) {
+        if (lineEnd > lineStart && *(lineEnd - 1) == L'\r') {
+            lineEnd--;
+        }
         *lineEnd = L'\0';
         
-        // Пропускаем пустые строки и "List of devices"
         if (lineStart[0] != L'\0' && wcsstr(lineStart, L"List of devices") == nullptr) {
-            // Пропускаем строку "total N" — это не файл
-            if (_wcsnicmp(lineStart, L"total", 5) == 0) {
-                lineStart = lineEnd + 2;
-                continue;
+            if (_wcsnicmp(lineStart, L"total", 5) != 0) {
+                bool isFolder = (lineStart[0] == L'd');
+                wchar_t* fileNameStart = lineStart;
+                
+                for (int pass = 0; pass < 7; pass++) {
+                    while (*fileNameStart != L'\0' && *fileNameStart != L' ') fileNameStart++;
+                    while (*fileNameStart != L'\0' && (*fileNameStart == L' ' || *fileNameStart == L'\t')) fileNameStart++;
+                }
+                
+                if (fc > 0) wcscat_s(fileList, fileListSize, L",");
+                wcscat_s(fileList, fileListSize, L"{\"Name\":\"");
+                
+                wchar_t* jsonDst = fileList + wcslen(fileList);
+                for (size_t ei = 0; fileNameStart[ei] != L'\0' && fileNameStart[ei] != L' ' && fileNameStart[ei] != L'\r' && fileNameStart[ei] != L'\n' && ei < 1023; ei++) {
+                    if (fileNameStart[ei] == L'"') { *jsonDst = L'\\'; jsonDst++; *jsonDst = L'"'; jsonDst++; }
+                    else { *jsonDst = fileNameStart[ei]; jsonDst++; }
+                }
+                *jsonDst = L'\0';
+                
+                wcscat_s(fileList, fileListSize, L"\",\"IsFolder\":");
+                wcscat_s(fileList, fileListSize, isFolder ? L"true" : L"false");
+                wcscat_s(fileList, fileListSize, L"}");
+                fc++;
             }
-            
-            // Формат: drwxrwx--- 2 root everybody 3488 2022-08-12 10:12 FileName
-            // Первый символ определяет тип: 'd' = директория, '-' = файл
-            bool isFolder = (lineStart[0] == L'd');
-            
-            // Ищем имя файла — оно после последнего пробела/табуляции
-            // Формат: drwxrwx--- 2 root everybody 3488 2026-07-01 13:32 MiuiFastConnect
-            wchar_t* fileNameStart = lineStart;
-            
-            // Пропускаем permissions (drwxrwx---) — до первого пробела
-            while (*fileNameStart != L'\0' && *fileNameStart != L' ') fileNameStart++;
-            // Пропускаем пробелы
-            while (*fileNameStart != L'\0' && (*fileNameStart == L' ' || *fileNameStart == L'\t')) fileNameStart++;
-            // Пропускаем links (2)
-            while (*fileNameStart != L'\0' && *fileNameStart != L' ') fileNameStart++;
-            // Пропускаем пробелы
-            while (*fileNameStart != L'\0' && (*fileNameStart == L' ' || *fileNameStart == L'\t')) fileNameStart++;
-            // Пропускаем owner (root)
-            while (*fileNameStart != L'\0' && *fileNameStart != L' ') fileNameStart++;
-            // Пропускаем пробелы
-            while (*fileNameStart != L'\0' && (*fileNameStart == L' ' || *fileNameStart == L'\t')) fileNameStart++;
-            // Пропускаем group (everybody)
-            while (*fileNameStart != L'\0' && *fileNameStart != L' ') fileNameStart++;
-            // Пропускаем пробелы
-            while (*fileNameStart != L'\0' && (*fileNameStart == L' ' || *fileNameStart == L'\t')) fileNameStart++;
-            // Пропускаем size (число, например 3488)
-            while (*fileNameStart != L'\0' && *fileNameStart != L' ') fileNameStart++;
-            // Пропускаем пробелы
-            while (*fileNameStart != L'\0' && (*fileNameStart == L' ' || *fileNameStart == L'\t')) fileNameStart++;
-            // Пропускаем date (2026-07-01)
-            while (*fileNameStart != L'\0' && *fileNameStart != L' ') fileNameStart++;
-            // Пропускаем пробелы
-            while (*fileNameStart != L'\0' && (*fileNameStart == L' ' || *fileNameStart == L'\t')) fileNameStart++;
-            // Пропускаем time (13:32)
-            while (*fileNameStart != L'\0' && *fileNameStart != L' ') fileNameStart++;
-            // Пропускаем пробелы
-            while (*fileNameStart != L'\0' && (*fileNameStart == L' ' || *fileNameStart == L'\t')) fileNameStart++;
-            // Теперь fileNameStart указывает на имя файла!
-            
-            // Логирование для отладки
-            wchar_t debugPath[512];
-            swprintf_s(debugPath, L"[SHELL] ls line: '%s' -> fileNameStart='%s'", lineStart, fileNameStart);
-            DebugLogW(debugPath);
-            
-            if (fc > 0) wcscat_s(fileList, fileListSize, L",");
-            wcscat_s(fileList, fileListSize, L"{\"Name\":\"");
-            
-            // Копируем имя файла напрямую — используем отдельный указатель!
-            wchar_t* jsonDst = fileList + wcslen(fileList);
-            for (size_t ei = 0; fileNameStart[ei] != L'\0' && fileNameStart[ei] != L' ' && fileNameStart[ei] != L'\r' && fileNameStart[ei] != L'\n' && ei < 1023; ei++) {
-                if (fileNameStart[ei] == L'"') { *jsonDst = L'\\'; jsonDst++; *jsonDst = L'"'; jsonDst++; }
-                else { *jsonDst = fileNameStart[ei]; jsonDst++; }
-            }
-            *jsonDst = L'\0';
-            
-            wcscat_s(fileList, fileListSize, L"\",\"IsFolder\":");
-            wcscat_s(fileList, fileListSize, isFolder ? L"true" : L"false");
-            wcscat_s(fileList, fileListSize, L"}");
-            fc++;
         }
-        lineStart = lineEnd + 2;
+        lineStart = lineEnd + 1;
     }
+    
     delete[] normalized;
-    delete[] copy;
     return fc > 0;
-}
-
-// ===== Извлечение модели из вывода adb devices -l =====
-static void ExtractModelFromAdbOutput(const wchar_t* adbOutput, const wchar_t* serial, wchar_t* model, DWORD modelSize)
-{
-    model[0] = L'\0';
-    if (!adbOutput || !serial || adbOutput[0] == L'\0' || serial[0] == L'\0') return;
-    
-    // Ищем строку с этим серийным номером
-    const wchar_t* lineStart = wcsstr(adbOutput, serial);
-    if (!lineStart) return;
-    
-    // Находим конец строки
-    const wchar_t* lineEnd = wcsstr(lineStart, L"\r\n");
-    if (!lineEnd) lineEnd = wcsstr(lineStart, L"\n");
-    if (!lineEnd) lineEnd = lineStart + wcslen(lineStart);
-    
-    // Ищем "model:" в строке
-    const wchar_t* modelPos = wcsstr(lineStart, L"model:");
-    if (!modelPos || modelPos >= lineEnd) return;
-    
-    modelPos += 6; // пропускаем "model:"
-    
-    // Копируем модель до пробела или конца строки
-    DWORD modelLen = 0;
-    while (*modelPos != L'\0' && *modelPos != L' ' && *modelPos != L'\t' && *modelPos != L'\r' && *modelPos != L'\n' 
-           && modelPos < lineEnd && modelLen < modelSize - 1) {
-        model[modelLen++] = *modelPos++;
-    }
-    model[modelLen] = L'\0';
-}
-
-// ===== Debug logging =====
-static void DebugLogW(const wchar_t* msg) { OutputDebugStringW(msg); OutputDebugStringW(L"\r\n"); }
-static void DebugLogFmtW(const wchar_t* fmt, ...) {
-    va_list args; va_start(args, fmt); wchar_t buf[1024]; vswprintf_s(buf, 1024, fmt, args); va_end(args);
-    OutputDebugStringW(buf); OutputDebugStringW(L"\r\n");
-}
-
-// Логирование с указанием метода и шага
-static const wchar_t* g_currentMethod = L"None";
-
-static void SetMethodContext(const wchar_t* method) { g_currentMethod = method; }
-static void DebugLogStepW(const wchar_t* step) {
-    wchar_t msg[1024];
-    swprintf_s(msg, L"[DBG] %s: %s", g_currentMethod, step);
-    OutputDebugStringW(msg);
-    OutputDebugStringW(L"\r\n");
-    WriteLog(msg);
 }
 
 uint32_t ADBFileDriver::EnumerateMtpDevices()
 {
     m_DeviceCount = 0; m_DeviceList[0] = L'\0'; m_CurrentPath[0] = L'\0';
-    wchar_t buf[256];
     
-    SetMethodContext(L"EnumerateDevices");
-    DebugLogStepW(L"ENTER — начало ПеречислитьУстройства");
+    { wchar_t msg[256]; swprintf_s(msg, L"[ENUM] Начало перечисления устройств"); WriteLog(msg); }
     
-    // Находим adb.exe
-    if (!FindAdbExe()) {
-        DebugLogStepW(L"ERROR: adb.exe не найден");
+    if (!FindAdbExe(m_AdbDirectory)) {
         wcscpy_s(m_Status, 512, L"Ошибка: adb.exe не найден");
         wcscpy_s(m_DeviceList, 8192, L"[]");
+        { WriteLog(L"[ENUM] adb.exe не найден"); }
         return 0;
     }
-    DebugLogStepW(L"adb.exe найден, путь:");
-    DebugLogFmtW(L"[ENUM] adb.exe path: %s", g_adbPath);
     
-    // === ВЫПОЛНЯЕМ ПЕРВУЮ КОМАНДУ devices -l ===
-    // ADB автоматически запускает сервер при первой команде если он не запущен
-    DebugLogStepW(L"Вызов adb devices -l (автоматический запуск сервера)");
     wchar_t adbDevices[65536] = L"";
-    bool adbResult = AdbExec(L"devices -l", adbDevices, sizeof(adbDevices));
-    
-    // Логирование вывода adb devices
-    if (adbResult) {
-        if (wcslen(adbDevices) > 0 && wcslen(adbDevices) < 4096) {
-            DebugLogFmtW(L"[ENUM] devices -l УСПЕХ (%d символов):\n%s", (int)wcslen(adbDevices), adbDevices);
-        } else if (wcslen(adbDevices) >= 4096) {
-            DebugLogW(L"[ENUM] devices -l УСПЕХ (вывод слишком длинный для логирования)");
-        } else {
-            DebugLogW(L"[ENUM] devices -l УСПЕХ (пустой ответ)");
-        }
-    } else {
-        DebugLogW(L"[ENUM] devices -l ОШИБКА");
+    if (!AdbExec(L"devices -l", adbDevices, sizeof(adbDevices))) {
         wcscpy_s(m_Status, 512, L"При запуске ADB возникла ошибка");
         wcscpy_s(m_DeviceList, 8192, L"[]");
+        { WriteLog(L"[ENUM] AdbExec devices -l failed"); }
         return 0;
     }
     
-    // Логирование полного вывода adb devices
-    if (wcslen(adbDevices) > 0 && wcslen(adbDevices) < 4096) {
-        wchar_t logLine[4096];
-        swprintf_s(logLine, L"[ENUM] adb devices FULL OUTPUT:\n%s", adbDevices);
-        DebugLogW(logLine);
-        
-        // Логирование построчно
-        wchar_t* parseCopy = new wchar_t[wcslen(adbDevices) + 1];
-        wcscpy_s(parseCopy, wcslen(adbDevices) + 1, adbDevices);
-        wchar_t* lineStart = parseCopy;
-        wchar_t* lineEnd;
-        int lineNum = 0;
-        while ((lineEnd = wcsstr(lineStart, L"\r\n")) != nullptr) {
-            *lineEnd = L'\0';
-            if (lineStart[0] != L'\0') {
-                DebugLogFmtW(L"[ENUM] adb line[%d]: '%s'", lineNum, lineStart);
-                lineNum++;
-            }
-            lineStart = lineEnd + 2;
-        }
-        if (lineStart[0] != L'\0') {
-            DebugLogFmtW(L"[ENUM] adb line[%d]: '%s'", lineNum, lineStart);
-        }
-        delete[] parseCopy;
-    } else {
-        DebugLogW(L"[ENUM] adb devices output is empty or too long");
+    struct AdbDeviceEntry {
+        wchar_t serial[256];
+        wchar_t product[256];
+        wchar_t model[256];
+    };
+    AdbDeviceEntry adbEntries[256];
+    int adbDeviceCount = 0;
+    
+    wchar_t* adbCopy = new wchar_t[wcslen(adbDevices) + 1];
+    wcscpy_s(adbCopy, wcslen(adbDevices) + 1, adbDevices);
+    
+    wchar_t* normalized = new wchar_t[wcslen(adbCopy) * 2 + 1];
+    wchar_t* dst = normalized;
+    const wchar_t* src = adbCopy;
+    while (*src != L'\0') {
+        if (*src == L'\n') { *dst++ = L'\r'; *dst++ = L'\n'; }
+        else *dst++ = *src;
+        src++;
     }
+    *dst = L'\0';
+    delete[] adbCopy;
     
-    HDEVINFO hDevInfo = SetupDiGetClassDevsW((GUID*)NULL, L"USB", NULL, DIGCF_PRESENT | DIGCF_ALLCLASSES);
-    if (hDevInfo == INVALID_HANDLE_VALUE) {
-        DWORD err = GetLastError();
-        swprintf_s(buf, L"[ADBFileDriver] SetupDiGetClassDevsW failed: error=%d", err);
-        DebugLogW(buf); wcscpy_s(m_DeviceList, 8192, L"[]"); return 0;
-    }
-    
-    int totalDev = 0, usbDev = 0, androidVid = 0, connected = 0, mtpFound = 0;
-    SP_DEVINFO_DATA devInfo = { sizeof(devInfo) };
-    
-    for (DWORD i = 0; ; i++) {
-        if (!SetupDiEnumDeviceInfo(hDevInfo, i, &devInfo)) break;
-        totalDev++;
-        
-        wchar_t pnpId[1024] = L"";
-        CM_Get_Device_IDW(devInfo.DevInst, pnpId, 1024, 0);
-        if (pnpId[0] == L'\0') continue;
-        
-        wchar_t friendlyName[512] = L"";
-        SetupDiGetDeviceRegistryPropertyW(hDevInfo, &devInfo, SPDRP_FRIENDLYNAME, NULL, (PBYTE)friendlyName, 512, NULL);
-        if (friendlyName[0] == L'\0') SetupDiGetDeviceRegistryPropertyW(hDevInfo, &devInfo, SPDRP_DEVICEDESC, NULL, (PBYTE)friendlyName, 512, NULL);
-        
-        if (!IsAndroidVendorId(pnpId)) continue;
-        usbDev++; androidVid++;
-        
-        DWORD status, errMsg;
-        if (CM_Get_DevNode_Status(&status, &errMsg, devInfo.DevInst, 0) != CR_SUCCESS) continue;
-        
-        HKEY hKey = SetupDiOpenDevRegKey(hDevInfo, &devInfo, DICS_FLAG_GLOBAL, 0, DIREG_DEV, KEY_READ);
-        bool connected2 = (hKey != INVALID_HANDLE_VALUE);
-        if (hKey != INVALID_HANDLE_VALUE) CloseHandle(hKey);
-        if (!connected2) continue;
-        connected++;
-        
-        wchar_t pnpId2[1024] = L"";
-        CM_Get_Device_IDW(devInfo.DevInst, pnpId2, 1024, 0);
-        
-        // Не фильтруем по MTP — все Android USB устройства подходят
-        mtpFound++;
-        
-        // Извлекаем Serial из PnpId (последняя часть после последнего \)
-        wchar_t serialNumber[256] = L"";
-        const wchar_t* lastSlash = wcsrchr(pnpId, L'\\');
-        if (lastSlash && *(lastSlash + 1) != L'\0') {
-            wcscpy_s(serialNumber, 256, lastSlash + 1);
-        }
-        
-        // Проверяем есть ли это устройство в списке ADB
-        // Формат строки: "SERIAL\tstatus ..." или "SERIAL  status ..." (пробелы вместо табуляции)
-        bool isAdbDevice = false;
-        if (serialNumber[0] != L'\0') {
-            // Ищем "SERIAL" followed by whitespace and "device"
-            const wchar_t* searchPos = wcsstr(adbDevices, serialNumber);
-            if (searchPos != nullptr) {
-                // Проверяем что после serial идёт \t или пробелы и затем "device"
-                const wchar_t* afterSerial = searchPos + wcslen(serialNumber);
-                // Пропускаем табуляции и пробелы
-                while (*afterSerial == L'\t' || *afterSerial == L' ') afterSerial++;
-                if (wcsncmp(afterSerial, L"device", 6) == 0 || wcsncmp(afterSerial, L"offline", 7) == 0) {
-                    isAdbDevice = true;
-                }
-            }
-        }
-        
-        DebugLogFmtW(L"[ENUM] Device: PnpId=%s, Serial=%s, ADB=%d", pnpId, serialNumber, isAdbDevice ? 1 : 0);
-        
-        // Если устройство не найдено в списке ADB, пропускаем
-        if (!isAdbDevice) {
-            DebugLogW(L"[ENUM]   Skipping — not in adb devices list");
-            // Добавляем подробную информацию для отладки
-            DebugLogFmtW(L"[ENUM]   Checked pattern: '%s\\tdevice'", serialNumber);
-            
-            // Покажем все ADB serial для сравнения
-            wchar_t* adbCopy = new wchar_t[wcslen(adbDevices) + 1];
-            wcscpy_s(adbCopy, wcslen(adbDevices) + 1, adbDevices);
-            wchar_t* adbLineStart = adbCopy;
-            wchar_t* adbLineEnd;
-            int adbLineNum = 0;
-            DebugLogW(L"[ENUM]   ADB devices list content:");
-            while ((adbLineEnd = wcsstr(adbLineStart, L"\r\n")) != nullptr) {
-                *adbLineEnd = L'\0';
-                if (adbLineStart[0] != L'\0' && wcsstr(adbLineStart, L"List of devices") == nullptr) {
-                    // Извлекаем serial из строки adb (первое поле до '\t')
-                    wchar_t* tabPos = wcschr(adbLineStart, L'\t');
-                    if (tabPos) {
-                        *tabPos = L'\0';
-                        DebugLogFmtW(L"[ENUM]   ADB device[%d]: serial='%s', full='%s'", adbLineNum, adbLineStart, adbLineStart);
-                    } else {
-                        DebugLogFmtW(L"[ENUM]   ADB device[%d]: '%s'", adbLineNum, adbLineStart);
-                    }
-                }
-                adbLineStart = adbLineEnd + 2;
-                adbLineNum++;
-            }
-            delete[] adbCopy;
+    wchar_t* savePtr = nullptr;
+    wchar_t* line = wcstok_s(normalized, L"\r\n", &savePtr);
+    while (line != nullptr) {
+        if (wcsstr(line, L"List of devices") != nullptr || line[0] == L'\0') {
+            line = wcstok_s(nullptr, L"\r\n", &savePtr);
             continue;
         }
         
-        if (m_DeviceCount == 0) wcscpy_s(m_DeviceList, 8192, L"[");
-        else wcscat_s(m_DeviceList, 8192, L",");
+        wchar_t serial[256] = L"";
+        wchar_t product[256] = L"";
+        wchar_t model[256] = L"";
         
-        // Формируем JSON вручную чтобы избежать проблем с экранированием
-        wchar_t jsonDevice[4096] = L"";
-        wcscat_s(jsonDevice, 4096, L"{\"Serial\":\"");
-        
-        // Экранируем serialNumber
-        if (serialNumber[0] != L'\0') {
-            for (size_t si = 0; serialNumber[si] != L'\0' && si < 256; si++) {
-                if (serialNumber[si] == L'"') wcscat_s(jsonDevice, 4096, L"\\\"");
-                else if (serialNumber[si] == L'\\') wcscat_s(jsonDevice, 4096, L"\\\\");
-                else {
-                    wchar_t ch[2] = { serialNumber[si], L'\0' };
-                    wcscat_s(jsonDevice, 4096, ch);
-                }
+        {
+            const wchar_t* start = line;
+            const wchar_t* end = line;
+            while (*end != L'\0' && (*end == L' ' || *end == L'\t')) end++;
+            const wchar_t* serialStart = end;
+            while (*end != L'\0' && *end != L' ' && *end != L'\t' && *end != L'\r' && *end != L'\n') end++;
+            size_t serialLen = (size_t)(end - serialStart);
+            if (serialLen > 0 && serialLen < 256) {
+                wcsncpy_s(serial, 256, serialStart, serialLen);
             }
         }
-        wcscat_s(jsonDevice, 4096, L"\",\"Name\":\"");
         
-        // Экранируем Name — используем модель из adb devices -l
-        wchar_t deviceModel[256] = L"";
-        ExtractModelFromAdbOutput(adbDevices, serialNumber, deviceModel, sizeof(deviceModel) / sizeof(wchar_t));
+        const wchar_t* productPos = wcsstr(line, L"product:");
+        if (productPos != nullptr) {
+            const wchar_t* prodVal = productPos + 8;
+            const wchar_t* prodEnd = wcschr(prodVal, L' ');
+            if (prodEnd != nullptr) {
+                size_t prodLen = (size_t)(prodEnd - prodVal);
+                if (prodLen > 0 && prodLen < 256) wcsncpy_s(product, 256, prodVal, prodLen);
+            } else {
+                wcscpy_s(product, 256, prodVal);
+            }
+        }
         
-        if (deviceModel[0] != L'\0') {
-            // Используем модель устройства
-            for (size_t si = 0; deviceModel[si] != L'\0' && si < 256; si++) {
-                if (deviceModel[si] == L'"') wcscat_s(jsonDevice, 4096, L"\\\"");
-                else if (deviceModel[si] == L'\\') wcscat_s(jsonDevice, 4096, L"\\\\");
-                else {
-                    wchar_t ch[2] = { deviceModel[si], L'\0' };
-                    wcscat_s(jsonDevice, 4096, ch);
-                }
+        const wchar_t* modelPos = wcsstr(line, L"model:");
+        if (modelPos != nullptr) {
+            const wchar_t* modelVal = modelPos + 6;
+            const wchar_t* modelEnd = wcschr(modelVal, L' ');
+            if (modelEnd != nullptr) {
+                size_t modelLen = (size_t)(modelEnd - modelVal);
+                if (modelLen > 0 && modelLen < 256) wcsncpy_s(model, 256, modelVal, modelLen);
+            } else {
+                wcscpy_s(model, 256, modelVal);
             }
-        } else if (friendlyName[0] != L'\0') {
-            // fallback: friendlyName USB устройства
-            for (size_t si = 0; friendlyName[si] != L'\0' && si < 512; si++) {
-                if (friendlyName[si] == L'"') wcscat_s(jsonDevice, 4096, L"\\\"");
-                else if (friendlyName[si] == L'\\') wcscat_s(jsonDevice, 4096, L"\\\\");
-                else {
-                    wchar_t ch[2] = { friendlyName[si], L'\0' };
-                    wcscat_s(jsonDevice, 4096, ch);
-                }
-            }
+        }
+        
+        bool hasDevice = false;
+        const wchar_t* devCheck = wcsstr(line, L" device ");
+        if (devCheck != nullptr) {
+            hasDevice = true;
         } else {
-            wcscat_s(jsonDevice, 4096, L"Unknown");
+            size_t lineLen = wcslen(line);
+            if (lineLen >= 7 && wcsncmp(line + lineLen - 7, L" device", 6) == 0) {
+                hasDevice = true;
+            } else {
+                devCheck = wcsstr(line, L" device\t");
+                if (devCheck != nullptr) {
+                    hasDevice = true;
+                }
+            }
         }
         
-        DebugLogFmtW(L"[ENUM] Device model: %s", deviceModel[0] != L'\0' ? deviceModel : friendlyName);
-        wcscat_s(jsonDevice, 4096, L"\"}");
+        if (hasDevice && serial[0] != L'\0') {
+            wcscpy_s(adbEntries[adbDeviceCount].serial, 256, serial);
+            wcscpy_s(adbEntries[adbDeviceCount].product, 256, product);
+            wcscpy_s(adbEntries[adbDeviceCount].model, 256, model);
+            adbDeviceCount++;
+        }
         
-        wcscat_s(m_DeviceList, 8192, jsonDevice);
-        m_DeviceCount++;
+        line = wcstok_s(nullptr, L"\r\n", &savePtr);
+    }
+    delete[] normalized;
+    
+    bool* usbDeviceProcessed = new bool[adbDeviceCount];
+    for (int i = 0; i < adbDeviceCount; i++) usbDeviceProcessed[i] = false;
+    
+    HDEVINFO hDevInfo = SetupDiGetClassDevsW((GUID*)NULL, L"USB", NULL, DIGCF_PRESENT | DIGCF_ALLCLASSES);
+    if (hDevInfo != INVALID_HANDLE_VALUE) {
+        SP_DEVINFO_DATA devInfo = { sizeof(devInfo) };
+        
+        for (DWORD i = 0; ; i++) {
+            if (!SetupDiEnumDeviceInfo(hDevInfo, i, &devInfo)) break;
+            
+            wchar_t pnpId[1024] = L"";
+            CM_Get_Device_IDW(devInfo.DevInst, pnpId, 1024, 0);
+            if (pnpId[0] == L'\0') continue;
+            
+            wchar_t friendlyName[512] = L"";
+            SetupDiGetDeviceRegistryPropertyW(hDevInfo, &devInfo, SPDRP_FRIENDLYNAME, NULL, (PBYTE)friendlyName, 512, NULL);
+            if (friendlyName[0] == L'\0') SetupDiGetDeviceRegistryPropertyW(hDevInfo, &devInfo, SPDRP_DEVICEDESC, NULL, (PBYTE)friendlyName, 512, NULL);
+            
+            if (!IsAndroidVendorId(pnpId)) continue;
+            
+            DWORD status, errMsg;
+            if (CM_Get_DevNode_Status(&status, &errMsg, devInfo.DevInst, 0) != CR_SUCCESS) continue;
+            
+            HKEY hKey = SetupDiOpenDevRegKey(hDevInfo, &devInfo, DICS_FLAG_GLOBAL, 0, DIREG_DEV, KEY_READ);
+            bool connected = (hKey != INVALID_HANDLE_VALUE);
+            if (hKey != INVALID_HANDLE_VALUE) CloseHandle(hKey);
+            if (!connected) continue;
+            
+            wchar_t serialNumber[256] = L"";
+            const wchar_t* lastSlash = wcsrchr(pnpId, L'\\');
+            if (lastSlash && *(lastSlash + 1) != L'\0') wcscpy_s(serialNumber, 256, lastSlash + 1);
+            
+            for (int j = 0; j < adbDeviceCount; j++) {
+                if (!usbDeviceProcessed[j] && wcsncmp(adbEntries[j].serial, serialNumber, 256) == 0) {
+                    usbDeviceProcessed[j] = true;
+                    
+                    if (m_DeviceCount == 0) wcscpy_s(m_DeviceList, 8192, L"[");
+                    else wcscat_s(m_DeviceList, 8192, L",");
+                    
+                    wchar_t jsonDevice[4096] = L"";
+                    wcscat_s(jsonDevice, 4096, L"{\"Serial\":\"");
+                    
+                    for (size_t si = 0; adbEntries[j].serial[si] != L'\0' && si < 256; si++) {
+                        if (adbEntries[j].serial[si] == L'"') wcscat_s(jsonDevice, 4096, L"\\\"");
+                        else if (adbEntries[j].serial[si] == L'\\') wcscat_s(jsonDevice, 4096, L"\\\\");
+                        else { wchar_t ch[2] = { adbEntries[j].serial[si], L'\0' }; wcscat_s(jsonDevice, 4096, ch); }
+                    }
+                    wcscat_s(jsonDevice, 4096, L"\",\"Name\":\"");
+                    
+                    if (adbEntries[j].model[0] != L'\0') {
+                        for (size_t si = 0; adbEntries[j].model[si] != L'\0' && si < 256; si++) {
+                            if (adbEntries[j].model[si] == L'"') wcscat_s(jsonDevice, 4096, L"\\\"");
+                            else if (adbEntries[j].model[si] == L'\\') wcscat_s(jsonDevice, 4096, L"\\\\");
+                            else { wchar_t ch[2] = { adbEntries[j].model[si], L'\0' }; wcscat_s(jsonDevice, 4096, ch); }
+                        }
+                    } else if (friendlyName[0] != L'\0') {
+                        for (size_t si = 0; friendlyName[si] != L'\0' && si < 512; si++) {
+                            if (friendlyName[si] == L'"') wcscat_s(jsonDevice, 4096, L"\\\"");
+                            else if (friendlyName[si] == L'\\') wcscat_s(jsonDevice, 4096, L"\\\\");
+                            else { wchar_t ch[2] = { friendlyName[si], L'\0' }; wcscat_s(jsonDevice, 4096, ch); }
+                        }
+                    } else {
+                        wcscat_s(jsonDevice, 4096, L"Unknown");
+                    }
+                    
+                    wcscat_s(jsonDevice, 4096, L"\"}");
+                    wcscat_s(m_DeviceList, 8192, jsonDevice);
+                    m_DeviceCount++;
+                    break;
+                }
+            }
+        }
+        
+        SetupDiDestroyDeviceInfoList(hDevInfo);
     }
     
-    SetupDiDestroyDeviceInfoList(hDevInfo);
+    for (int i = 0; i < adbDeviceCount; i++) {
+        if (!usbDeviceProcessed[i]) {
+            const wchar_t* serial = adbEntries[i].serial;
+            
+            bool alreadyAdded = false;
+            wchar_t searchPattern[512];
+            swprintf_s(searchPattern, 512, L"\"Serial\":\"%s\"", serial);
+            if (wcsstr(m_DeviceList, searchPattern) != nullptr) {
+                alreadyAdded = true;
+            }
+            
+            if (!alreadyAdded) {
+                if (m_DeviceCount == 0) wcscpy_s(m_DeviceList, 8192, L"[");
+                else wcscat_s(m_DeviceList, 8192, L",");
+                
+                wchar_t jsonDevice[4096] = L"";
+                wcscat_s(jsonDevice, 4096, L"{\"Serial\":\"");
+                
+                for (size_t si = 0; serial[si] != L'\0' && si < 256; si++) {
+                    if (serial[si] == L'"') wcscat_s(jsonDevice, 4096, L"\\\"");
+                    else if (serial[si] == L'\\') wcscat_s(jsonDevice, 4096, L"\\\\");
+                    else { wchar_t ch[2] = { serial[si], L'\0' }; wcscat_s(jsonDevice, 4096, ch); }
+                }
+                wcscat_s(jsonDevice, 4096, L"\",\"Name\":\"");
+                
+                if (adbEntries[i].model[0] != L'\0') {
+                    for (size_t si = 0; adbEntries[i].model[si] != L'\0' && si < 256; si++) {
+                        if (adbEntries[i].model[si] == L'"') wcscat_s(jsonDevice, 4096, L"\\\"");
+                        else if (adbEntries[i].model[si] == L'\\') wcscat_s(jsonDevice, 4096, L"\\\\");
+                        else { wchar_t ch[2] = { adbEntries[i].model[si], L'\0' }; wcscat_s(jsonDevice, 4096, ch); }
+                    }
+                } else {
+                    for (size_t si = 0; serial[si] != L'\0' && si < 256; si++) {
+                        if (serial[si] == L'"') wcscat_s(jsonDevice, 4096, L"\\\"");
+                        else if (serial[si] == L'\\') wcscat_s(jsonDevice, 4096, L"\\\\");
+                        else { wchar_t ch[2] = { serial[si], L'\0' }; wcscat_s(jsonDevice, 4096, ch); }
+                    }
+                }
+                
+                wcscat_s(jsonDevice, 4096, L"\"}");
+                wcscat_s(m_DeviceList, 8192, jsonDevice);
+                m_DeviceCount++;
+            }
+        }
+    }
+    
+    delete[] usbDeviceProcessed;
+    
     if (m_DeviceCount > 0) wcscat_s(m_DeviceList, 8192, L"]");
     else wcscpy_s(m_DeviceList, 8192, L"[]");
     
-    DebugLogFmtW(L"[ENUM] Result: deviceCount=%d", m_DeviceCount);
+    { wchar_t msg[256]; swprintf_s(msg, L"[ENUM] Найдено устройств: %d", m_DeviceCount); WriteLog(msg); }
     return m_DeviceCount;
 }
 
 bool ADBFileDriver::ConnectToDevice(const wchar_t* deviceName)
 {
-    wchar_t dbgMsg[512], adbOutput[65536];
-    SetMethodContext(L"Connect");
-    DebugLogStepW(L"ENTER — начало Подключить");
+    { wchar_t msg[512]; swprintf_s(msg, L"[CONNECT] Начало подключения, deviceName=%s", deviceName ? deviceName : L"(null)"); WriteLog(msg); }
     
-    if (!FindAdbExe()) {
-        DebugLogStepW(L"ERROR: adb.exe не найден");
+    if (!FindAdbExe(m_AdbDirectory)) {
         wcscpy_s(m_Status, 512, L"Ошибка: adb.exe не найден");
+        { WriteLog(L"[CONNECT] adb.exe не найден"); }
         return false;
     }
-    DebugLogStepW(L"adb.exe найден");
     
-    // Проверяем что подключено
-    if (m_bConnected) { 
-        DebugLogStepW(L"Устройство уже подключено, отключаем");
-        DisconnectDevice(); 
-    }
+    if (m_bConnected) { DisconnectDevice(); }
     
-    // Получаем список устройств
-    DebugLogStepW(L"Вызов adb devices -l");
     wchar_t adbDevices[65536] = L"";
-    bool adbResult = AdbExec(L"devices -l", adbDevices, sizeof(adbDevices));
-    
-    if (!adbResult) {
-        DebugLogW(L"[CONNECT] devices -l ОШИБКА");
+    if (!AdbExec(L"devices -l", adbDevices, sizeof(adbDevices))) {
         wcscpy_s(m_Status, 512, L"При запуске ADB возникла ошибка");
         return false;
     }
     
-    if (wcslen(adbDevices) > 0 && wcslen(adbDevices) < 4096) {
-        DebugLogFmtW(L"[CONNECT] devices -l УСПЕХ (%d символов):\n%s", (int)wcslen(adbDevices), adbDevices);
-    }
-    
-    // Парсим список устройств
     const wchar_t* targetSerial = nullptr;
     
-    // deviceName — это Serial устройства (или пустая строка для первого)
     if (deviceName != nullptr && deviceName[0] != L'\0') {
-        // Ищем устройство по Serial в m_DeviceList
-        DebugLogFmtW(L"[CONNECT] Ищем по Serial: %s", deviceName);
-        
         wchar_t pattern[512];
         swprintf_s(pattern, 512, L"\"Serial\":\"%s\"", deviceName);
-        
         const wchar_t* matchPos = wcsstr(m_DeviceList, pattern);
         if (matchPos) {
-            // Нашли совпадение — Serial уже известен
             wcscpy_s(m_AdbSerial, 256, deviceName);
             targetSerial = m_AdbSerial;
-            DebugLogFmtW(L"[CONNECT] Найдено по Serial: %s", targetSerial);
-        } else {
-            DebugLogFmtW(L"[CONNECT] Устройство с Serial '%s' НЕ найдено в m_DeviceList", deviceName);
-            DebugLogFmtW(L"[CONNECT] m_DeviceList = %s", m_DeviceList);
         }
     }
     
-    // Иначе берём первое устройство из последнего списка
     if (targetSerial == nullptr) {
-        DebugLogW(L"[CONNECT] targetSerial == nullptr — выбираем первое устройство из m_DeviceList");
-        
-        // Ищем первый Serial в JSON: {"Serial":"...","Name":"..."}
-        const wchar_t* searchPos = m_DeviceList;
-        const wchar_t* serialKey = wcsstr(searchPos, L"\"Serial\":\"");
+        const wchar_t* serialKey = wcsstr(m_DeviceList, L"\"Serial\":\"");
         if (serialKey) {
             const wchar_t* sf = serialKey + 10;
             const wchar_t* se = wcsstr(sf, L"\"");
@@ -1174,30 +901,22 @@ bool ADBFileDriver::ConnectToDevice(const wchar_t* deviceName)
                 size_t sl = se - sf;
                 if (sl > 0 && sl < 256) { wcsncpy_s(m_AdbSerial, 256, sf, sl); m_AdbSerial[sl] = L'\0'; }
                 targetSerial = m_AdbSerial;
-                DebugLogFmtW(L"[CONNECT] Первое устройство: %s", targetSerial);
-                
-                // Сохраняем Serial первого устройства
                 wcscpy_s(m_LastDeviceSerial, 256, m_AdbSerial);
             }
-        }
-        
-        if (targetSerial == nullptr) {
-            DebugLogW(L"[CONNECT] Не нашли устройств в m_DeviceList");
         }
     }
     
     if (targetSerial == nullptr || targetSerial[0] == L'\0') {
-        DebugLogW(L"[CONNECT] ERROR: ADB-устройство не найдено");
         wcscpy_s(m_Status, 512, L"Ошибка: ADB-устройство не найдено");
+        { WriteLog(L"[CONNECT] Устройство не найдено"); }
         return false;
     }
     
-    DebugLogFmtW(L"[CONNECT] Подключено к: %s", targetSerial);
     m_bConnected = true;
     wcscpy_s(m_Status, 512, L"Подключено (ADB)");
     wcscpy_s(m_CurrentPath, 1024, L"");
     
-    DebugLogStepW(L"Подключено успешно");
+    { wchar_t msg[512]; swprintf_s(msg, L"[CONNECT] Подключено к: %s", targetSerial); WriteLog(msg); }
     return true;
 }
 
@@ -1208,13 +927,7 @@ void ADBFileDriver::DisconnectDevice()
     m_AdbSerial[0] = L'\0';
     m_CurrentPath[0] = L'\0';
     wcscpy_s(m_Status, 512, L"Не подключен");
-    
-    // Завершаем ADB сервер
-    if (FindAdbExe()) {
-        wchar_t adbOutput[1024] = L"";
-        AdbExec(L"kill-server", adbOutput, sizeof(adbOutput));
-        DebugLogW(L"[DISCONNECT] ADB сервер завершён");
-    }
+    { WriteLog(L"[DISCONNECT] Отключено"); }
 }
 
 uint32_t ADBFileDriver::EnumerateFilesOnDevice(const wchar_t* remotePath)
@@ -1222,12 +935,8 @@ uint32_t ADBFileDriver::EnumerateFilesOnDevice(const wchar_t* remotePath)
     m_FileCount = 0; m_FileList[0] = L'\0';
     if (!m_bConnected) { wcscpy_s(m_FileList, 65536, L"[]"); return 0; }
     
-    // Обновить текущий каталог
-    if (remotePath && remotePath[0] != L'\0') {
-        wcscpy_s(m_CurrentPath, 1024, remotePath);
-    } else {
-        m_CurrentPath[0] = L'\0';
-    }
+    if (remotePath && remotePath[0] != L'\0') wcscpy_s(m_CurrentPath, 1024, remotePath);
+    else m_CurrentPath[0] = L'\0';
     
     if (!AdbShellList(m_AdbSerial, remotePath ? remotePath : L"/", m_FileList, sizeof(m_FileList))) {
         wcscpy_s(m_FileList, 65536, L"[]"); return 0;
@@ -1242,12 +951,8 @@ uint32_t ADBFileDriver::ListFileNames(const wchar_t* remotePath)
     m_FileCount = 0; m_FileList[0] = L'\0';
     if (!m_bConnected) { wcscpy_s(m_FileList, 65536, L"[]"); return 0; }
     
-    // Обновить текущий каталог
-    if (remotePath && remotePath[0] != L'\0') {
-        wcscpy_s(m_CurrentPath, 1024, remotePath);
-    } else {
-        m_CurrentPath[0] = L'\0';
-    }
+    if (remotePath && remotePath[0] != L'\0') wcscpy_s(m_CurrentPath, 1024, remotePath);
+    else m_CurrentPath[0] = L'\0';
     
     if (!AdbShellList(m_AdbSerial, remotePath ? remotePath : L"/", m_FileList, sizeof(m_FileList))) {
         wcscpy_s(m_FileList, 65536, L"[]"); return 0;
@@ -1265,117 +970,65 @@ bool ADBFileDriver::DownloadFile(const wchar_t* fileName, wchar_t** content, uin
     if (m_CurrentPath[0] != L'\0') swprintf_s(remotePath, 1024, L"%s/%s", m_CurrentPath, fileName);
     else swprintf_s(remotePath, 1024, L"/%s", fileName);
     
-    // Создаём временный файл для временного хранения
     wchar_t tempPath[MAX_PATH];
     if (!GetTempPathW(MAX_PATH, tempPath)) return false;
     wchar_t tempFile[MAX_PATH];
     GetTempFileNameW(tempPath, L"ADB", 0, tempFile);
     
-    // Скачиваем файл во временный файл
     wchar_t cmd[2048];
-    if (m_AdbSerial[0] != L'\0') {
-        swprintf_s(cmd, 2048, L"-s %s pull \"%s\" \"%s\"", m_AdbSerial, remotePath, tempFile);
-    } else {
-        swprintf_s(cmd, 2048, L"pull \"%s\" \"%s\"", remotePath, tempFile);
-    }
+    if (m_AdbSerial[0] != L'\0') swprintf_s(cmd, 2048, L"-s %s pull \"%s\" \"%s\"", m_AdbSerial, remotePath, tempFile);
+    else swprintf_s(cmd, 2048, L"pull \"%s\" \"%s\"", remotePath, tempFile);
     
-    if (!AdbExec(cmd, nullptr, 0)) {
-        DeleteFileW(tempFile);
-        return false;
-    }
+    if (!AdbExec(cmd, nullptr, 0)) { DeleteFileW(tempFile); return false; }
     
-    // Читаем содержимое временного файла
     HANDLE hFile = CreateFileW(tempFile, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (hFile == INVALID_HANDLE_VALUE) {
-        DeleteFileW(tempFile);
-        return false;
-    }
+    if (hFile == INVALID_HANDLE_VALUE) { DeleteFileW(tempFile); return false; }
     
     DWORD fileSize = GetFileSize(hFile, NULL);
     if (fileSize == INVALID_FILE_SIZE || fileSize == 0) {
-        CloseHandle(hFile);
-        DeleteFileW(tempFile);
+        CloseHandle(hFile); DeleteFileW(tempFile);
         if (content) *content = nullptr;
         if (contentSize) *contentSize = 0;
-        return true; // Пустой файл — не ошибка
+        return true;
     }
     
-    // Читаем файл как UTF-8
     char* buffer = new (std::nothrow) char[fileSize + 1];
-    if (!buffer) {
-        CloseHandle(hFile);
-        DeleteFileW(tempFile);
-        return false;
-    }
+    if (!buffer) { CloseHandle(hFile); DeleteFileW(tempFile); return false; }
     
     DWORD bytesRead = 0;
-    if (!ReadFile(hFile, buffer, fileSize, &bytesRead, NULL)) {
-        delete[] buffer;
-        CloseHandle(hFile);
-        DeleteFileW(tempFile);
-        return false;
-    }
+    if (!ReadFile(hFile, buffer, fileSize, &bytesRead, NULL)) { delete[] buffer; CloseHandle(hFile); DeleteFileW(tempFile); return false; }
     CloseHandle(hFile);
     
-    // Конвертируем UTF-8 в UTF-16
     int wLen = MultiByteToWideChar(CP_UTF8, 0, buffer, bytesRead, NULL, 0);
-    if (wLen <= 0) {
-        delete[] buffer;
-        DeleteFileW(tempFile);
-        return false;
-    }
+    if (wLen <= 0) { delete[] buffer; DeleteFileW(tempFile); return false; }
     
     wchar_t* wBuffer = new (std::nothrow) wchar_t[wLen + 1];
-    if (!wBuffer) {
-        delete[] buffer;
-        DeleteFileW(tempFile);
-        return false;
-    }
+    if (!wBuffer) { delete[] buffer; DeleteFileW(tempFile); return false; }
     
     MultiByteToWideChar(CP_UTF8, 0, buffer, bytesRead, wBuffer, wLen);
     wBuffer[wLen] = L'\0';
+    delete[] buffer;
     
-    // Возвращаем содержимое через параметр
     if (content && contentSize) {
-        *contentSize = (uint32_t)(wLen + 1); // с терминальным нулём
-        *content = new (std::nothrow) wchar_t[*contentSize];
-        if (*content) {
-            wcscpy_s(*content, *contentSize, wBuffer);
-            
-            // Логирование для отладки терминального нуля
-            wchar_t debugInfo[512];
-            swprintf_s(debugInfo, 512, L"[DOWNLOAD] fileName='%s', contentSize=%d, wLen=%d, bytesRead=%d, fileSize=%d", 
-                      fileName, *contentSize, wLen, (int)bytesRead, (int)fileSize);
-            DebugLogW(debugInfo);
-            
-            // Показываем последние 10 байт исходного файла
-            if (bytesRead >= 10) {
-                char lastBytes[11] = {0};
-                memcpy(lastBytes, buffer + bytesRead - 10, 10);
-                swprintf_s(debugInfo, 512, L"[DOWNLOAD] last 10 bytes: ");
-                for (int i = 0; i < 10; i++) {
-                    wchar_t byteStr[8];
-                    swprintf_s(byteStr, 8, L"%02x ", (unsigned char)lastBytes[i]);
-                    wcscat_s(debugInfo, 512, byteStr);
-                }
-                DebugLogW(debugInfo);
+        uint32_t dataLen = (uint32_t)wLen;
+        while (dataLen > 0 && (wBuffer[dataLen - 1] == L'\r' || wBuffer[dataLen - 1] == L'\n' || wBuffer[dataLen - 1] == L'\0')) dataLen--;
+        
+        uint16_t* resultVal = nullptr;
+        uint32_t resultLen = 0;
+        if (dataLen == 0) {
+            if (m_iMemory && m_iMemory->AllocMemory((void**)&resultVal, 2)) {
+                resultVal[0] = L'\0';
             }
-            
-            // Показываем последние 5 символов UTF-16
-            wchar_t lastChars[10] = {0};
-            int lastLen = (wLen >= 5) ? 5 : wLen;
-            memcpy(lastChars, wBuffer + wLen - lastLen, lastLen * sizeof(wchar_t));
-            swprintf_s(debugInfo, 512, L"[DOWNLOAD] last %d wchar_t: ", lastLen);
-            for (int i = 0; i < lastLen; i++) {
-                wchar_t charStr[16];
-                swprintf_s(charStr, 16, L"[%d]=%04x ", i, (unsigned short)lastChars[i]);
-                wcscat_s(debugInfo, 512, charStr);
-            }
-            DebugLogW(debugInfo);
+            resultLen = 0;
+        } else if (m_iMemory && m_iMemory->AllocMemory((void**)&resultVal, (unsigned long)((dataLen + 1) * sizeof(WCHAR_T)))) {
+            for (uint32_t i = 0; i < dataLen; i++) resultVal[i] = wBuffer[i];
+            resultVal[dataLen] = L'\0';
+            resultLen = dataLen;
         }
+        if (content) *content = (wchar_t*)resultVal;
+        if (contentSize) *contentSize = resultLen;
     }
     
-    delete[] buffer;
     delete[] wBuffer;
     DeleteFileW(tempFile);
     return true;
@@ -1385,30 +1038,19 @@ bool ADBFileDriver::UploadFile(const wchar_t* remoteName, const wchar_t* content
 {
     if (!m_bConnected) return false;
     
-    // Создаём временный файл
     wchar_t tempPath[MAX_PATH];
     if (!GetTempPathW(MAX_PATH, tempPath)) return false;
     wchar_t tempFile[MAX_PATH];
     GetTempFileNameW(tempPath, L"ADB", 0, tempFile);
     
-    // Записываем содержимое во временный файл как UTF-8
     HANDLE hFile = CreateFileW(tempFile, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hFile == INVALID_HANDLE_VALUE) return false;
     
-    // Конвертируем UTF-16 в UTF-8
     int utf8Len = WideCharToMultiByte(CP_UTF8, 0, content, contentLen, NULL, 0, NULL, NULL);
-    if (utf8Len <= 0) {
-        CloseHandle(hFile);
-        DeleteFileW(tempFile);
-        return false;
-    }
+    if (utf8Len <= 0) { CloseHandle(hFile); DeleteFileW(tempFile); return false; }
     
     char* utf8Buffer = new (std::nothrow) char[utf8Len + 1];
-    if (!utf8Buffer) {
-        CloseHandle(hFile);
-        DeleteFileW(tempFile);
-        return false;
-    }
+    if (!utf8Buffer) { CloseHandle(hFile); DeleteFileW(tempFile); return false; }
     
     WideCharToMultiByte(CP_UTF8, 0, content, contentLen, utf8Buffer, utf8Len, NULL, NULL);
     utf8Buffer[utf8Len] = '\0';
@@ -1418,7 +1060,6 @@ bool ADBFileDriver::UploadFile(const wchar_t* remoteName, const wchar_t* content
     CloseHandle(hFile);
     delete[] utf8Buffer;
     
-    // Загружаем файл на устройство
     wchar_t remotePath[1024];
     if (m_CurrentPath[0] != L'\0') swprintf_s(remotePath, 1024, L"%s/%s", m_CurrentPath, remoteName);
     else swprintf_s(remotePath, 1024, L"/%s", remoteName);
@@ -1428,10 +1069,7 @@ bool ADBFileDriver::UploadFile(const wchar_t* remoteName, const wchar_t* content
     else swprintf_s(cmd, 2048, L"push \"%s\" \"%s\"", tempFile, remotePath);
     
     bool result = AdbExec(cmd, nullptr, 0);
-    
-    // Удаляем временный файл
     DeleteFileW(tempFile);
-    
     return result;
 }
 
@@ -1466,23 +1104,11 @@ bool ADBFileDriver::FindFileByName(const wchar_t* fileName, const wchar_t*)
 
 bool ADBFileDriver::CallAsFunc(const long lMethodNum, tVariant* pvarRetValue, tVariant* paParams, const long)
 {
-    // Детальное логирование входа в метод
-    wchar_t enterMsg[512];
-    swprintf_s(enterMsg, L"[CALL] CallAsFunc ENTER: lMethodNum=%ld, paParams=%p, pvarRetValue=%p, VT=0x%04X", 
-               lMethodNum, (void*)paParams, (void*)pvarRetValue, paParams ? (paParams[0].vt) : 0xFFFFFFFF);
-    DebugLogW(enterMsg);
-    DebugLogW(L"[CALL] CallAsFunc: BEFORE tVarInit");
-    
-    // Инициализируем возвращаемое значение перед использованием
     tVarInit(pvarRetValue);
-    wchar_t vtMsg[256];
-    swprintf_s(vtMsg, L"[CALL] CallAsFunc: AFTER tVarInit, VT=0x%04X", pvarRetValue->vt);
-    DebugLogW(vtMsg);
     
-    __try {
+    try {
         switch (lMethodNum) {
-            case 0: {
-                OutputDebugStringW(L"[CALL] case 0: EnumerateDevices START");
+            case 0: { // ПеречислитьУстройства
                 uint32_t count = EnumerateMtpDevices();
                 size_t len = wcslen(m_DeviceList) + 1;
                 pvarRetValue->pwstrVal = nullptr;
@@ -1491,53 +1117,23 @@ bool ADBFileDriver::CallAsFunc(const long lMethodNum, tVariant* pvarRetValue, tV
                     convToShortWchar((WCHAR_T**)&pvarRetValue->pwstrVal, m_DeviceList, (uint32_t)len);
                     pvarRetValue->wstrLen = (uint32_t)wcslen(m_DeviceList);
                 }
-                else {
-                    // Если память не удалось выделить, возвращаем пустую строку
-                    static const wchar_t emptyStr[] = L"";
-                    pvarRetValue->pwstrVal = nullptr;
-                    pvarRetValue->wstrLen = 0;
-                }
                 TV_VT(pvarRetValue) = VTYPE_PWSTR;
                 return true;
             }
-            case 1: {
-                OutputDebugStringW(L"[CALL] case 1: Connect START");
-                
-                // Логирование параметров
-                if (paParams) {
-                    wchar_t paramMsg[512];
-                    swprintf_s(paramMsg, L"[CALL] case 1: paParams=%p, paParams[0].vt=0x%04X, paParams[0].pwstrVal=%p",
-                               (void*)paParams, paParams[0].vt, (void*)paParams[0].pwstrVal);
-                    DebugLogW(paramMsg);
-                    
-                    if (paParams[0].pwstrVal != nullptr) {
-                        wchar_t paramName[512];
-                        swprintf_s(paramName, L"[CALL] case 1: deviceName='%s'", paParams[0].pwstrVal);
-                        DebugLogW(paramName);
-                    } else {
-                        DebugLogW(L"[CALL] case 1: deviceName is NULL");
-                    }
-                } else {
-                    DebugLogW(L"[CALL] case 1: paParams is NULL");
-                }
-                
-                DebugLogW(L"[CALL] case 1: BEFORE ConnectToDevice");
-                bool result = (paParams && paParams[0].pwstrVal != nullptr) ? ConnectToDevice(paParams[0].pwstrVal) : ConnectToDevice(nullptr);
-                wchar_t resMsg[128];
-                swprintf_s(resMsg, L"[CALL] case 1: AFTER ConnectToDevice, result=%d", result ? 1 : 0);
-                DebugLogW(resMsg);
-                
+            case 1: { // Подключить
+                const wchar_t* deviceName = (paParams && paParams[0].pwstrVal != nullptr) ? paParams[0].pwstrVal : nullptr;
+                bool result = ConnectToDevice(deviceName);
                 TV_VT(pvarRetValue) = VTYPE_BOOL;
                 TV_BOOL(pvarRetValue) = result ? VARIANT_TRUE : VARIANT_FALSE;
-                DebugLogW(L"[CALL] case 1: BEFORE return");
                 return true;
             }
-            case 2: 
-                DisconnectDevice(); 
+            case 2: { // Отключить
+                DisconnectDevice();
                 TV_VT(pvarRetValue) = VTYPE_BOOL;
-                TV_BOOL(pvarRetValue) = VARIANT_TRUE;
+                TV_BOOL(pvarRetValue) = (VARIANT_TRUE != 0);
                 return true;
-            case 3: {
+            }
+            case 3: { // СписокФайлов
                 const wchar_t* path = (paParams && paParams[0].pwstrVal != nullptr) ? paParams[0].pwstrVal : L"";
                 m_FileCount = EnumerateFilesOnDevice(path);
                 size_t len = wcslen(m_FileList) + 1;
@@ -1547,96 +1143,57 @@ bool ADBFileDriver::CallAsFunc(const long lMethodNum, tVariant* pvarRetValue, tV
                     convToShortWchar((WCHAR_T**)&pvarRetValue->pwstrVal, m_FileList, (uint32_t)len);
                     pvarRetValue->wstrLen = (uint32_t)wcslen(m_FileList);
                 }
-                else {
-                    pvarRetValue->pwstrVal = nullptr;
-                    pvarRetValue->wstrLen = 0;
-                }
                 TV_VT(pvarRetValue) = VTYPE_PWSTR;
                 return true;
             }
-            case 4: {
-                // СкачатьФайл(ИмяФайла) → возвращает содержимое файла
+            case 4: { // СкачатьФайл
                 const wchar_t* fn = (paParams && paParams[0].pwstrVal != nullptr) ? paParams[0].pwstrVal : L"";
                 
                 wchar_t* fileContent = nullptr;
                 uint32_t contentSize = 0;
-                
                 bool success = DownloadFile(fn, &fileContent, &contentSize);
                 
                 pvarRetValue->pwstrVal = nullptr;
                 pvarRetValue->wstrLen = 0;
                 
                 if (success && fileContent != nullptr) {
-                    // contentSize включает терминальный ноль, вычитаем его
                     uint32_t dataLen = contentSize - 1;
+                    while (dataLen > 0 && (fileContent[dataLen - 1] == L'\r' || fileContent[dataLen - 1] == L'\n' || fileContent[dataLen - 1] == L'\0')) dataLen--;
                     
-                    // Удаляем trailing символы (adb pull добавляет \r\n в конец)
-                    while (dataLen > 0 && (fileContent[dataLen - 1] == L'\r' || fileContent[dataLen - 1] == L'\n' || fileContent[dataLen - 1] == L'\0')) {
-                        dataLen--;
-                    }
-                    
-                    if (dataLen == 0) {
-                        // Пустой файл
-                        if (m_iMemory && m_iMemory->AllocMemory((void**)&pvarRetValue->pwstrVal, 2)) {
-                            pvarRetValue->pwstrVal[0] = L'\0';
-                            pvarRetValue->wstrLen = 0;
-                        }
-                    } else if (m_iMemory && m_iMemory->AllocMemory((void**)&pvarRetValue->pwstrVal, (unsigned long)((dataLen + 1) * sizeof(WCHAR_T)))) {
-                        // Копируем только нужное количество символов
-                        for (uint32_t i = 0; i < dataLen; i++) {
-                            pvarRetValue->pwstrVal[i] = fileContent[i];
-                        }
+                    if (dataLen > 0 && m_iMemory && m_iMemory->AllocMemory((void**)&pvarRetValue->pwstrVal, (unsigned long)((dataLen + 1) * sizeof(WCHAR_T)))) {
+                        for (uint32_t i = 0; i < dataLen; i++) pvarRetValue->pwstrVal[i] = fileContent[i];
                         pvarRetValue->pwstrVal[dataLen] = L'\0';
                         pvarRetValue->wstrLen = dataLen;
                     }
                     delete[] fileContent;
-                }
-                else {
-                    // Возвращаем пустую строку при ошибке
-                    static const wchar_t emptyStr[] = L"";
+                } else {
                     if (m_iMemory && m_iMemory->AllocMemory((void**)&pvarRetValue->pwstrVal, 2)) {
                         pvarRetValue->pwstrVal[0] = L'\0';
-                        pvarRetValue->wstrLen = 0;
                     }
+                    pvarRetValue->wstrLen = 0;
                 }
                 
                 TV_VT(pvarRetValue) = VTYPE_PWSTR;
-                
-                // Лог результата
-                if (pvarRetValue->pwstrVal) {
-                    wchar_t retLog[1024];
-                    swprintf_s(retLog, L"[DOWNLOAD] RETURN: vt=0x%04X, wstrLen=%d, content='%s'",
-                               pvarRetValue->vt, pvarRetValue->wstrLen, pvarRetValue->pwstrVal);
-                    DebugLogW(retLog);
-                }
                 return true;
             }
-            case 5: {
-                // ЗагрузитьФайл(ИмяНаУстройстве, Содержание)
+            case 5: { // ЗагрузитьФайл
                 const wchar_t* rn = (paParams && paParams[0].pwstrVal != nullptr) ? paParams[0].pwstrVal : L"";
+                const wchar_t* content = (paParams && paParams[1].vt == VTYPE_PWSTR && paParams[1].pwstrVal != nullptr) ? paParams[1].pwstrVal : L"";
+                uint32_t contentLen = (paParams && paParams[1].vt == VTYPE_PWSTR && paParams[1].pwstrVal != nullptr) ? (uint32_t)wcslen(content) : 0;
                 
-                // Получаем содержание — строка
-                const wchar_t* content = nullptr;
-                uint32_t contentLen = 0;
-                
-                if (paParams && paParams[1].vt == VTYPE_PWSTR && paParams[1].pwstrVal != nullptr) {
-                    content = paParams[1].pwstrVal;
-                    contentLen = (uint32_t)wcslen(content);
-                }
-                
-                bool success = UploadFile(rn, content ? content : L"", contentLen);
-                
+                bool success = UploadFile(rn, content, contentLen);
                 TV_VT(pvarRetValue) = VTYPE_BOOL;
                 TV_BOOL(pvarRetValue) = success ? VARIANT_TRUE : VARIANT_FALSE;
                 return true;
             }
-            case 6: {
+            case 6: { // УдалитьФайл
                 const wchar_t* fn = (paParams && paParams[0].pwstrVal != nullptr) ? paParams[0].pwstrVal : L"";
+                bool result = DeleteFile(fn);
                 TV_VT(pvarRetValue) = VTYPE_BOOL;
-                TV_BOOL(pvarRetValue) = DeleteFile(fn) ? VARIANT_TRUE : VARIANT_FALSE;
+                TV_BOOL(pvarRetValue) = result ? VARIANT_TRUE : VARIANT_FALSE;
                 return true;
             }
-            case 7: {
+            case 7: { // СписокИменФайлов
                 const wchar_t* rp = (paParams && paParams[0].pwstrVal != nullptr) ? paParams[0].pwstrVal : L"";
                 m_FileCount = ListFileNames(rp);
                 size_t len = wcslen(m_FileList) + 1;
@@ -1646,35 +1203,14 @@ bool ADBFileDriver::CallAsFunc(const long lMethodNum, tVariant* pvarRetValue, tV
                     convToShortWchar((WCHAR_T**)&pvarRetValue->pwstrVal, m_FileList, (uint32_t)len);
                     pvarRetValue->wstrLen = (uint32_t)wcslen(m_FileList);
                 }
-                else {
-                    pvarRetValue->pwstrVal = nullptr;
-                    pvarRetValue->wstrLen = 0;
-                }
                 TV_VT(pvarRetValue) = VTYPE_PWSTR;
                 return true;
             }
-            case 8: {
-                const wchar_t* rp = (paParams && paParams[0].pwstrVal != nullptr) ? paParams[0].pwstrVal : L"";
-                m_FileCount = EnumerateFilesOnDevice(rp);
-                size_t len = wcslen(m_FileList) + 1;
-                pvarRetValue->pwstrVal = nullptr;
-                pvarRetValue->wstrLen = 0;
-                if (len > 1 && m_iMemory && m_iMemory->AllocMemory((void**)&pvarRetValue->pwstrVal, (unsigned long)(len * sizeof(WCHAR_T)))) {
-                    convToShortWchar((WCHAR_T**)&pvarRetValue->pwstrVal, m_FileList, (uint32_t)len);
-                    pvarRetValue->wstrLen = (uint32_t)wcslen(m_FileList);
-                }
-                else {
-                    pvarRetValue->pwstrVal = nullptr;
-                    pvarRetValue->wstrLen = 0;
-                }
-                TV_VT(pvarRetValue) = VTYPE_PWSTR;
-                return true;
-            }
-            default: 
+            default:
                 TV_VT(pvarRetValue) = VTYPE_EMPTY;
                 return false;
         }
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
+    } catch (...) {
         if (m_iConnect) {
             EXCEPINFO info; ZeroMemory(&info, sizeof(EXCEPINFO));
             info.wCode = ADDIN_E_FAIL; info.bstrSource = SysAllocString(L"ADBFileDriver");
