@@ -42,10 +42,38 @@ static wchar_t g_adbPath[512] = L"";
 static wchar_t g_LogPathGlobal[512] = L"";
 static bool g_LogEnabled = false;
 
+// ===== Буфер для хранения информации инициализации =====
+static wchar_t g_InitLogBuffer[4096] = L"";
+static bool g_InitLogBufferDirty = false;
+
+static void InitLogBuffer_Add(const wchar_t* msg)
+{
+    if (msg == nullptr || g_InitLogBuffer[0] == L'\0') {
+        if (msg) wcscpy_s(g_InitLogBuffer, 4096, msg);
+        g_InitLogBufferDirty = true;
+        return;
+    }
+    size_t currentLen = wcslen(g_InitLogBuffer);
+    size_t msgLen = wcslen(msg);
+    if (currentLen + msgLen + 2 < 4095) {
+        g_InitLogBuffer[currentLen] = L'\n';
+        g_InitLogBuffer[currentLen + 1] = L'\0';
+        wcscat_s(g_InitLogBuffer + currentLen, 4096 - currentLen, msg);
+        g_InitLogBufferDirty = true;
+    }
+}
+
+static void InitLogBuffer_Clear()
+{
+    g_InitLogBuffer[0] = L'\0';
+    g_InitLogBufferDirty = false;
+}
+
 // ===== Forward declarations =====
 static bool FindAdbExe(const wchar_t* adbDirectory);
 static bool AdbExec(const wchar_t* args, wchar_t* output, DWORD outputSize);
 static bool AdbShellList(const wchar_t* serial, const wchar_t* remotePath, wchar_t* fileList, DWORD fileListSize);
+static void WriteLog(const wchar_t* msg);
 
 // ===== WriteLog - запись в лог-файл =====
 static void WriteLog(const wchar_t* msg)
@@ -143,7 +171,7 @@ bool ADBFileDriver::Init(void* Interface)
     if (Interface == nullptr) return false;
     m_iConnect = static_cast<IAddInDefBase*>(Interface);
     m_bInitialized = true;
-    { wchar_t msg[256]; swprintf_s(msg, L"[INIT] Компонента создана, Initialized=true"); WriteLog(msg); }
+    { wchar_t msg[512]; swprintf_s(msg, L"[INIT] Факт подключения компоненты: успешно"); InitLogBuffer_Add(msg); }
     return true;
 }
 
@@ -158,10 +186,12 @@ long ADBFileDriver::GetInfo() { return 21000; }
 
 void ADBFileDriver::Done()
 {
+    { WriteLog(L"[DONE] Факт отключения компоненты: начинается"); }
     if (m_LogHandle != nullptr && m_LogHandle != INVALID_HANDLE_VALUE) { CloseHandle((HANDLE)m_LogHandle); m_LogHandle = nullptr; }
     if (m_iConnect) { m_iConnect = nullptr; }
     if (m_iMemory) { m_iMemory = nullptr; }
     m_bInitialized = false;
+    { WriteLog(L"[DONE] Факт отключения компоненты: завершено, ADB сервер не завершается (оставлен для других процессов)"); }
 }
 
 // ===== ILanguageExtenderBase - Свойства =====
@@ -296,6 +326,7 @@ bool ADBFileDriver::SetPropVal(const long lPropNum, tVariant* varPropVal)
                 m_EnableLog = (boolVal != 0);
                 wcscpy_s(g_LogPathGlobal, 512, m_LogPath);
                 g_LogEnabled = m_EnableLog;
+                { wchar_t msg[512]; swprintf_s(msg, L"[SET] Свойство EnableLog = %s", m_EnableLog ? L"true" : L"false"); InitLogBuffer_Add(msg); }
                 return true;
             }
             case 2: { // LogPath
@@ -305,6 +336,7 @@ bool ADBFileDriver::SetPropVal(const long lPropNum, tVariant* varPropVal)
                         wcscpy_s(m_LogPath, 512, varPropVal->pwstrVal);
                         wcscpy_s(g_LogPathGlobal, 512, m_LogPath);
                         g_LogEnabled = m_EnableLog;
+                        { wchar_t msg[512]; swprintf_s(msg, L"[SET] Свойство LogPath = %s", varPropVal->pwstrVal); InitLogBuffer_Add(msg); }
                     }
                 }
                 return true;
@@ -314,6 +346,7 @@ bool ADBFileDriver::SetPropVal(const long lPropNum, tVariant* varPropVal)
                     size_t len = wcslen(varPropVal->pwstrVal);
                     if (len > 0 && len < 511) {
                         wcscpy_s(m_AdbDirectory, 512, varPropVal->pwstrVal);
+                        { wchar_t msg[512]; swprintf_s(msg, L"[SET] Свойство КаталогADB = %s", varPropVal->pwstrVal); InitLogBuffer_Add(msg); }
                     }
                 }
                 return true;
@@ -538,6 +571,16 @@ static bool AdbExec(const wchar_t* args, wchar_t* output, DWORD outputSize)
     return true;
 }
 
+static void InitLogBuffer_Output()
+{
+    if (g_InitLogBufferDirty && g_InitLogBuffer[0] != L'\0') {
+        WriteLog(L"===== Инициализация =====");
+        WriteLog(g_InitLogBuffer);
+        WriteLog(L"===== Конец инициализации =====");
+        InitLogBuffer_Clear();
+    }
+}
+
 static bool AdbShellList(const wchar_t* serial, const wchar_t* remotePath, wchar_t* fileList, DWORD fileListSize)
 {
     wchar_t cmd[1024];
@@ -617,12 +660,13 @@ uint32_t ADBFileDriver::EnumerateMtpDevices()
 {
     m_DeviceCount = 0; m_DeviceList[0] = L'\0'; m_CurrentPath[0] = L'\0';
     
-    { wchar_t msg[256]; swprintf_s(msg, L"[ENUM] Начало перечисления устройств"); WriteLog(msg); }
+    { InitLogBuffer_Output(); }
+    { WriteLog(L"[METHOD] Выполнение метода ПеречислитьУстройства()"); }
     
     if (!FindAdbExe(m_AdbDirectory)) {
         wcscpy_s(m_Status, 512, L"Ошибка: adb.exe не найден");
         wcscpy_s(m_DeviceList, 8192, L"[]");
-        { WriteLog(L"[ENUM] adb.exe не найден"); }
+        { WriteLog(L"[METHOD] ПеречислитьУстройства() результат=Ошибка: adb.exe не найден"); }
         return 0;
     }
     
@@ -630,7 +674,7 @@ uint32_t ADBFileDriver::EnumerateMtpDevices()
     if (!AdbExec(L"devices -l", adbDevices, sizeof(adbDevices))) {
         wcscpy_s(m_Status, 512, L"При запуске ADB возникла ошибка");
         wcscpy_s(m_DeviceList, 8192, L"[]");
-        { WriteLog(L"[ENUM] AdbExec devices -l failed"); }
+        { WriteLog(L"[METHOD] ПеречислитьУстройства() результат=Ошибка: ADB не ответил"); }
         return 0;
     }
     
@@ -858,17 +902,17 @@ uint32_t ADBFileDriver::EnumerateMtpDevices()
     if (m_DeviceCount > 0) wcscat_s(m_DeviceList, 8192, L"]");
     else wcscpy_s(m_DeviceList, 8192, L"[]");
     
-    { wchar_t msg[256]; swprintf_s(msg, L"[ENUM] Найдено устройств: %d", m_DeviceCount); WriteLog(msg); }
+    { wchar_t msg[2048]; swprintf_s(msg, L"[METHOD] ПеречислитьУстройства() результат=%s", m_DeviceList); WriteLog(msg); }
     return m_DeviceCount;
 }
 
 bool ADBFileDriver::ConnectToDevice(const wchar_t* deviceName)
 {
-    { wchar_t msg[512]; swprintf_s(msg, L"[CONNECT] Начало подключения, deviceName=%s", deviceName ? deviceName : L"(null)"); WriteLog(msg); }
+    { wchar_t msg[512]; swprintf_s(msg, L"[METHOD] Выполнение метода Подключить(%s)", deviceName ? deviceName : L"(null)"); WriteLog(msg); }
     
     if (!FindAdbExe(m_AdbDirectory)) {
         wcscpy_s(m_Status, 512, L"Ошибка: adb.exe не найден");
-        { WriteLog(L"[CONNECT] adb.exe не найден"); }
+        { WriteLog(L"[METHOD] Подключить() результат=Ошибка: adb.exe не найден"); }
         return false;
     }
     
@@ -877,6 +921,7 @@ bool ADBFileDriver::ConnectToDevice(const wchar_t* deviceName)
     wchar_t adbDevices[65536] = L"";
     if (!AdbExec(L"devices -l", adbDevices, sizeof(adbDevices))) {
         wcscpy_s(m_Status, 512, L"При запуске ADB возникла ошибка");
+        { WriteLog(L"[METHOD] Подключить() результат=Ошибка: ADB не ответил"); }
         return false;
     }
     
@@ -908,7 +953,7 @@ bool ADBFileDriver::ConnectToDevice(const wchar_t* deviceName)
     
     if (targetSerial == nullptr || targetSerial[0] == L'\0') {
         wcscpy_s(m_Status, 512, L"Ошибка: ADB-устройство не найдено");
-        { WriteLog(L"[CONNECT] Устройство не найдено"); }
+        { WriteLog(L"[METHOD] Подключить() результат=Ошибка: устройство не найдено"); }
         return false;
     }
     
@@ -916,7 +961,7 @@ bool ADBFileDriver::ConnectToDevice(const wchar_t* deviceName)
     wcscpy_s(m_Status, 512, L"Подключено (ADB)");
     wcscpy_s(m_CurrentPath, 1024, L"");
     
-    { wchar_t msg[512]; swprintf_s(msg, L"[CONNECT] Подключено к: %s", targetSerial); WriteLog(msg); }
+    { wchar_t msg[1024]; swprintf_s(msg, L"[METHOD] Подключить(%s) результат=Успех, подключено к: %s, Status=%s, DeviceCount=%d", deviceName ? deviceName : L"(null)", targetSerial, m_Status, (int)m_DeviceCount); WriteLog(msg); }
     return true;
 }
 
@@ -927,7 +972,6 @@ void ADBFileDriver::DisconnectDevice()
     m_AdbSerial[0] = L'\0';
     m_CurrentPath[0] = L'\0';
     wcscpy_s(m_Status, 512, L"Не подключен");
-    { WriteLog(L"[DISCONNECT] Отключено"); }
 }
 
 uint32_t ADBFileDriver::EnumerateFilesOnDevice(const wchar_t* remotePath)
@@ -960,6 +1004,21 @@ uint32_t ADBFileDriver::ListFileNames(const wchar_t* remotePath)
     m_FileCount = 0;
     for (const wchar_t* p = m_FileList; *p; p++) if (*p == L'{') m_FileCount++;
     return m_FileCount;
+}
+
+// ===== Helper: convert tVariant to string for logging =====
+static void VariantToLogStr(tVariant* var, wchar_t* out, DWORD outSize)
+{
+    if (var == nullptr || out == nullptr || outSize == 0) { if (out) out[0] = L'\0'; return; }
+    out[0] = L'\0';
+    if (var->vt == VTYPE_PWSTR && var->pwstrVal != nullptr) {
+        DWORD maxLen = outSize / 2 - 1;
+        wcscpy_s(out, maxLen + 1, var->pwstrVal);
+    } else if (var->vt == VTYPE_BOOL) {
+        wcscpy_s(out, outSize, (var->bVal != 0) ? L"true" : L"false");
+    } else if (var->vt == VTYPE_I4) {
+        swprintf_s(out, outSize / 2, L"%d", (int)var->lVal);
+    }
 }
 
 bool ADBFileDriver::DownloadFile(const wchar_t* fileName, wchar_t** content, uint32_t* contentSize)
@@ -1135,7 +1194,10 @@ bool ADBFileDriver::CallAsFunc(const long lMethodNum, tVariant* pvarRetValue, tV
             }
             case 3: { // СписокФайлов
                 const wchar_t* path = (paParams && paParams[0].pwstrVal != nullptr) ? paParams[0].pwstrVal : L"";
+                { wchar_t msg[512]; swprintf_s(msg, L"[METHOD] Выполнение метода СписокФайлов(%s)", path); WriteLog(msg); }
                 m_FileCount = EnumerateFilesOnDevice(path);
+                { wchar_t msg[2048]; swprintf_s(msg, L"[METHOD] СписокФайлов(%s) результат=Успех, FileCount=%d, список=%s", path, (int)m_FileCount, m_FileList); WriteLog(msg); }
+                { wchar_t msg2[256]; swprintf_s(msg2, L"[STATUS] FileCount=%d", (int)m_FileCount); WriteLog(msg2); }
                 size_t len = wcslen(m_FileList) + 1;
                 pvarRetValue->pwstrVal = nullptr;
                 pvarRetValue->wstrLen = 0;
@@ -1148,6 +1210,7 @@ bool ADBFileDriver::CallAsFunc(const long lMethodNum, tVariant* pvarRetValue, tV
             }
             case 4: { // СкачатьФайл
                 const wchar_t* fn = (paParams && paParams[0].pwstrVal != nullptr) ? paParams[0].pwstrVal : L"";
+                { wchar_t msg[512]; swprintf_s(msg, L"[METHOD] Выполнение метода СкачатьФайл(%s)", fn); WriteLog(msg); }
                 
                 wchar_t* fileContent = nullptr;
                 uint32_t contentSize = 0;
@@ -1174,23 +1237,29 @@ bool ADBFileDriver::CallAsFunc(const long lMethodNum, tVariant* pvarRetValue, tV
                 }
                 
                 TV_VT(pvarRetValue) = VTYPE_PWSTR;
+                { wchar_t msg[512]; swprintf_s(msg, L"[METHOD] СкачатьФайл(%s) результат=%s", fn, success ? L"Успех" : L"Ошибка"); WriteLog(msg); }
                 return true;
             }
             case 5: { // ЗагрузитьФайл
                 const wchar_t* rn = (paParams && paParams[0].pwstrVal != nullptr) ? paParams[0].pwstrVal : L"";
                 const wchar_t* content = (paParams && paParams[1].vt == VTYPE_PWSTR && paParams[1].pwstrVal != nullptr) ? paParams[1].pwstrVal : L"";
                 uint32_t contentLen = (paParams && paParams[1].vt == VTYPE_PWSTR && paParams[1].pwstrVal != nullptr) ? (uint32_t)wcslen(content) : 0;
+                { wchar_t msg[512]; swprintf_s(msg, L"[METHOD] Выполнение метода ЗагрузитьФайл(%s)", rn); WriteLog(msg); }
+                { wchar_t msg2[1024]; swprintf_s(msg2, L"[METHOD] ЗагрузитьФайл(%s) Содержание=%s", rn, content ? content : L"(null)"); WriteLog(msg2); }
                 
                 bool success = UploadFile(rn, content, contentLen);
                 TV_VT(pvarRetValue) = VTYPE_BOOL;
                 TV_BOOL(pvarRetValue) = success ? VARIANT_TRUE : VARIANT_FALSE;
+                { wchar_t msg[512]; swprintf_s(msg, L"[METHOD] ЗагрузитьФайл(%s) результат=%s", rn, success ? L"Успех" : L"Ошибка"); WriteLog(msg); }
                 return true;
             }
             case 6: { // УдалитьФайл
                 const wchar_t* fn = (paParams && paParams[0].pwstrVal != nullptr) ? paParams[0].pwstrVal : L"";
+                { wchar_t msg[512]; swprintf_s(msg, L"[METHOD] Выполнение метода УдалитьФайл(%s)", fn); WriteLog(msg); }
                 bool result = DeleteFile(fn);
                 TV_VT(pvarRetValue) = VTYPE_BOOL;
                 TV_BOOL(pvarRetValue) = result ? VARIANT_TRUE : VARIANT_FALSE;
+                { wchar_t msg[512]; swprintf_s(msg, L"[METHOD] УдалитьФайл(%s) результат=%s", fn, result ? L"Успех" : L"Ошибка"); WriteLog(msg); }
                 return true;
             }
             case 7: { // СписокИменФайлов
